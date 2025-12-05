@@ -1,228 +1,97 @@
-// See LICENSE for license details.
-
 #include <stdint.h>
-#include <stddef.h>
-#include <assert.h>
-#include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
+
 #ifndef BAREMETAL
 #include <sys/mman.h>
+#include <stdlib.h>
+#include <sys/mman.h>
 #endif
-#include <time.h>
+
 #include "include/gemmini_testutils.h"
+#include "include/matmul_data.h" 
 
+// Match your header types
+#define DIM MATMUL_M
 
-#ifdef FAST
-#define AINIT RELU
-#define SINIT 12
-#define N 1
-#else
-#define AINIT NO_ACTIVATION
-#define SINIT 0
-#define N 2
-#endif
+typedef uint16_t elem_t;   // A_in: lower 8 bits = fp8:e4m3, upper bits zero
+typedef uint32_t welem_t;  // B_in: lower 8 bits = fp8:e4m3, upper bits zero
+typedef uint8_t  out_t;    // C_scaled: fp8:e4m3 (1 byte per output)
 
+// void load_scale_factors(uint64_t* src, size_t bytes) {
+//   volatile uint64_t *dst = (volatile uint64_t *)SCALE_FACT_MEM;
 
-void operands(int c, int * a, int * b, int * d) {
-  *d = c % N;
-  *b = (c / N) % N;
-  *a = c / (N*N);
-}
-
-#if 3*N*DIM > (BANK_NUM * BANK_ROWS) || N*N*N*DIM > ACC_ROWS
-//#error scratchpad or accumulator not big enough
-#endif
+//   for (int transactions = 0; transactions < (bytes + 7) / 8; transactions++) {
+//     dst[transactions] = src[transactions];
+//   }
+// }
 
 int main() {
 #ifndef BAREMETAL
-    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
-      perror("mlockall failed");
-      exit(1);
-    }
+  if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+    perror("mlockall");
+    return 1;
+  }
 #endif
 
-  static elem_t ZERO[DIM][DIM];
+  // ---- Buffers ----
+  // Inputs come from MATMUL_DATA_H: A_in[16][16], B_in[16][16]
+  static out_t C_hw[DIM][DIM] = {0};  // fp8 outputs from HW
 
+  // ---------- Run Gemmini (fp8 WS test) ----------
   gemmini_flush(0);
+  gemmini_config_ex(WEIGHT_STATIONARY, 0, 0);
+
+  // We want 1 byte per output element in DRAM
+  gemmini_extended_config_st(DIM * sizeof(out_t), NO_ACTIVATION, 1);
+
+  // Load per-element scaling factors into the scale SRAM
+  // (C_scale is uint8_t[DIM][DIM], packed row-major)
+  // load_scale_factors((const uint64_t *) C_scale, sizeof(C_scale));
+
+  // MVIN B as B^T for WS
+  gemmini_config_ld(DIM * sizeof(welem_t));
+  gemmini_mvin((void *) B_in, 1 * DIM);
+
+  // MVIN A
   gemmini_config_ld(DIM * sizeof(elem_t));
+  gemmini_mvin((void *) A_in, 0 * DIM);
 
-  for (int activation = AINIT; activation <= RELU; ++activation) {
-#ifdef ACC_SCALE_T_IS_FLOAT
-    for (acc_scale_t scale = 0; scale <= 1.5; scale += 0.5) {
-#else
-    for (acc_scale_t scale = SINIT; scale <= 12; scale += 4) {
-#endif
-      static elem_t A[N][DIM][DIM] row_align(1);
-      static elem_t B[N][DIM][DIM] row_align(1);
-      static elem_t D[N][DIM][DIM] row_align(1);
+  // Preload + compute
+  gemmini_config_ld(DIM * sizeof(welem_t));
+  gemmini_preload(1 * DIM, (1u << (ADDR_LEN - 1)));
+  gemmini_config_ld(DIM * sizeof(elem_t));
+  gemmini_compute_preloaded(0 * DIM, GARBAGE_ADDR);
 
-      // We will try out every combination of A, B, D possible
-      static elem_t C[N*N*N][DIM][DIM] row_align(1);
-      static full_t gold_full[N*N*N][DIM][DIM];
-      static elem_t gold[N*N*N][DIM][DIM];
+  // MVOUT scaled fp8 C
+  gemmini_mvout((void *) C_hw, (1u << (ADDR_LEN - 1)));
 
-      // ...taking into account whether we preload new weights or re-use the old ones
-      static int preload[N*N*N] = {1};
-      for (int i = 1; i < N*N*N; ++i)
-        preload[i] = rand() % 2;
+  // Single fence at the end, like your fp6 test
+  gemmini_fence();
 
-      // ...whether we pass in a D or just use zeros
-      static int add_to_zeros[N*N*N];
-      for (int i = 0; i < N*N*N; ++i)
-        add_to_zeros[i] = rand() % 2;
-
-      // ...and whether we accumulate on top of the previous result
-      static int accumulate[N*N*N] = {0};
-      for (int i = 1; i < N*N*N; ++i)
-        accumulate[i] = rand() % 2;
-
-      static int no_output[N*N*N];
-      for (int i = 0; i < N*N*N-1; ++i)
-        no_output[i] = accumulate[i+1];
-      no_output[N*N*N-1] = 0;
-
-      // Print the sequence out
-      /*printf("Preloads: ");
-      for (int i = 0; i < N*N*N; ++i)
-        printf("%d, ", preload[i]);
-      printf("\n");
-      printf("Zeros: ");
-      for (int i = 0; i < N*N*N; ++i)
-        printf("%d, ", add_to_zeros[i]);
-      printf("\n");
-      printf("Accumulates: ");
-      for (int i = 0; i < N*N*N; ++i)
-        printf("%d, ", accumulate[i]);
-      printf("\n");
-      printf("No outputs: ");
-      for (int i = 0; i < N*N*N; ++i)
-        printf("%d, ", no_output[i]);
-      printf("\n");*/
-
-      for (size_t n = 0; n < N; ++n) {
-        for (size_t i = 0; i < DIM; ++i) {
-          for (size_t j = 0; j < DIM; ++j) {
-            A[n][i][j] = (rand() % 64) - 32;
-            B[n][i][j] = (rand() % 64) - 32;
-            D[n][i][j] = (rand() % 64) - 32;
-          }
-        }
+  // ---------- Compare against golden fp8 (C_scaled) ----------
+  int errors = 0;
+  for (int i = 0; i < DIM; i++) {
+    for (int j = 0; j < DIM; j++) {
+      uint8_t got = C_hw[i][j];
+      uint8_t exp = C_scaled[i][j];
+      if (got != exp) {
+        printf("@(%d,%d) HW=0x%02x  EXP=0x%02x\n",
+               i, j, (unsigned) got, (unsigned) exp);
+        errors++;
       }
-
-      for (size_t g = 0; g < N*N*N; ++g) {
-        int a, b, d;
-        operands(g, &a, &b, &d);
-
-        // We need to find the last B value in case we aren't preloading new weights
-        for (int last_g = g; last_g >= 0; --last_g) {
-            int tmp_a, tmp_d;
-            if (preload[last_g]) {
-                operands(last_g, &tmp_a, &b, &tmp_d);
-                break;
-            }
-        }
-
-        if (add_to_zeros[g])
-          matmul(A[a], B[b], ZERO, gold_full[g]);
-        else
-          matmul(A[a], B[b], D[d], gold_full[g]);
-
-        if (accumulate[g])
-          matadd(gold_full[g], gold_full[g-1], gold_full[g]);
-      }
-
-      for (size_t g = 0; g < N*N*N; ++g) {
-        matscale(gold_full[g], gold[g], scale);
-        if (activation == RELU)
-          matrelu(gold[g], gold[g]);
-      }
-
-      uint32_t A_addr = 0;
-      uint32_t B_addr = N*DIM;
-      uint32_t D_addr = 2*N*DIM;
-      uint32_t C_addr_acc = 1 << (ADDR_LEN-1);
-
-      // Calculate the proper destination addresses of everything
-      uint32_t C_addrs[N*N*N];
-      for (size_t c = 0; c < N*N*N; ++c)
-        C_addrs[c] = C_addr_acc + c*DIM;
-      for (size_t c = 0; c < N*N*N; ++c) {
-        int last_c;
-        for (last_c = c; last_c >= 0; --last_c)
-          if (!accumulate[last_c])
-            break;
-        if (c != last_c)
-          C_addrs[c] = C_addrs[last_c] | (1 << (ADDR_LEN-2));
-      }
-
-      // printf("Moving in\n");
-      for (size_t n = 0; n < N; ++n)
-        gemmini_mvin(A[n], A_addr + n*DIM);
-
-      for (size_t n = 0; n < N; ++n)
-        gemmini_mvin(B[n], B_addr + n*DIM);
-
-      for (size_t n = 0; n < N; ++n)
-        if (n == N-1) {
-          gemmini_mvin(D[n], D_addr + n*DIM);
-        } else {
-          gemmini_mvin(D[n], D_addr + n*DIM);
-        }
-
-      // printf("Setting mode\n");
-      gemmini_config_ex(WEIGHT_STATIONARY, 0, 0);
-      gemmini_extended_config_st(DIM * sizeof(elem_t), activation, scale);
-
-      // printf("Matmulling\n");
-      for (size_t c = 0; c < N*N*N; ++c) {
-        int a, b, d;
-        operands(c, &a, &b, &d);
-
-        uint32_t d_addr = D_addr + d*DIM;
-        if (add_to_zeros[c])
-          d_addr = GARBAGE_ADDR;
-
-        if (!preload[c]) {
-          gemmini_preload_zeros(C_addrs[c]);
-          gemmini_compute_accumulated(A_addr + a*DIM, d_addr);
-        } else {
-          gemmini_preload(B_addr + b*DIM, C_addrs[c]);
-          gemmini_compute_preloaded(A_addr + a*DIM, d_addr);
-        }
-      }
-
-      // printf("Moving out\n");
-      for (size_t c = 0; c < N*N*N; ++c)
-        if (!no_output[c]) {
-          gemmini_mvout(C[c], C_addrs[c] & ~(1 << (ADDR_LEN-2)));
-        }
-
-      gemmini_fence();
-
-      /*printf("Moved out\n");
-      for (int n = 0; n < N*N*N; ++n) {
-        if (!no_output[n]) {
-          printf("C:\n");
-          printMatrix(C[n]);
-          printf("Gold:\n");
-          printMatrix(gold[n]);
-          printf("\n");
-        }
-      }*/
-
-      // printf("Checking\n");
-      for (int n = 0; n < N*N*N; ++n)
-        if (!no_output[n] && !is_equal(C[n], gold[n])) {
-          printf("activation: %d, scale: %d\n", activation, scale);
-          printf("Actual (%d):\n", n);
-          printMatrix(C[n]);
-          printf("\nGold:\n");
-          printMatrix(gold[n]);
-          exit(1);
-        }
     }
   }
 
-  exit(0);
-}
+  if (errors == 0) {
+    printf("fp8 WS matmul test PASSED (no mismatches).\n");
+  } else {
+    printf("fp8 WS matmul test FAILED with %d mismatches.\n", errors);
+  }
 
+#ifndef BAREMETAL
+  exit(errors != 0);
+#else
+  return errors != 0;
+#endif
+}
