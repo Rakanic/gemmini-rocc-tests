@@ -16,7 +16,7 @@
 
 typedef uint16_t elem_t;   // A_in: lower 8 bits = fp8:e4m3, upper bits zero
 typedef uint32_t welem_t;  // B_in: lower 8 bits = fp8:e4m3, upper bits zero
-typedef uint8_t  out_t;    // C_scaled: fp8:e4m3 (1 byte per output)
+typedef uint64_t  out_t;    // C_scaled: fp8:e4m3 (1 byte per output)
 
 // void load_scale_factors(uint64_t* src, size_t bytes) {
 //   volatile uint64_t *dst = (volatile uint64_t *)SCALE_FACT_MEM;
@@ -73,11 +73,11 @@ int main() {
   int errors = 0;
   for (int i = 0; i < DIM; i++) {
     for (int j = 0; j < DIM; j++) {
-      uint8_t got = C_hw[i][j];
-      uint8_t exp = C_scaled[i][j];
+      uint64_t got = C_hw[i][j];
+      uint64_t exp = (uint64_t) C_scaled[i][j];
       if (got != exp) {
-        // printf("@(%d,%d) HW=0x%02x  EXP=0x%02x\n",
-        //        i, j, (unsigned) got, (unsigned) exp);
+        printf("@(%d,%d) HW=0x%02x  EXP=0x%02x\n",
+               i, j, (unsigned) got, (unsigned) exp);
         errors++;
       }
     }

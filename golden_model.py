@@ -652,23 +652,23 @@ def run_experiment(
     print(C_scaled_pre_q.detach().cpu().numpy())
     print()
 
-    # Quantize scaled outputs to FP8 (scaled_spec), nearest-even
-    C_scaled = scaled_q(C_scaled_pre_q) if scaled_q is not None else C_scaled_pre_q
+    # Quantize scaled outputs to BF16 (this is what you want to export)
+    C_scaled_bf16 = q_bf16_rne(C_scaled_pre_q)
 
-    print(f"=== Output after scaling, quantized to {scaled_spec} (FP8, nearest-even) ===")
-    print(C_scaled.detach().cpu().numpy())
+    print("=== Output after scaling, quantized to BF16 (RNE) ===")
+    print(C_scaled_bf16.detach().cpu().numpy())
     print()
 
-    # Hex dump of scaled outputs in scaled_spec (FP8)
+    # Hex dump of scaled outputs as BF16
     try:
-        C_scaled_codes, C_scaled_bits = tensor_to_custom_fp_codes(C_scaled, scaled_spec)
+        C_scaled_codes, C_scaled_bits = tensor_to_custom_fp_codes(C_scaled_bf16, "bf16")
         C_scaled_hex = codes_to_hex_rows(C_scaled_codes, C_scaled_bits)
-        print(f"=== C_scaled hex encoding ({scaled_spec}) ===")
+        print("=== C_scaled hex encoding (bf16) ===")
         for row in C_scaled_hex:
             print(" ".join(row))
         print()
     except ValueError as e:
-        print(f"[WARN] Could not hex-encode scaled outputs for {scaled_spec}: {e}")
+        print(f"[WARN] Could not hex-encode scaled outputs for bf16: {e}")
         C_scaled_codes = []
         C_scaled_bits = 0
         print()
