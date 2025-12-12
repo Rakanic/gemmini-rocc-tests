@@ -76,8 +76,8 @@ int main() {
       uint8_t got = C_hw[i][j];
       uint8_t exp = C_scaled[i][j];
       if (got != exp) {
-        printf("@(%d,%d) HW=0x%02x  EXP=0x%02x\n",
-               i, j, (unsigned) got, (unsigned) exp);
+        // printf("@(%d,%d) HW=0x%02x  EXP=0x%02x\n",
+        //        i, j, (unsigned) got, (unsigned) exp);
         errors++;
       }
     }
