@@ -344,6 +344,144 @@ def matmul_outer_quantized_hwlike(
 
     return C
 
+def compute_tile_scale_matrix_fpe8m0(
+    A_scales_row: Tensor,     # shape [M, Gk]  (per-row, per-32 K-group)
+    B_scales_col: Tensor,     # shape [Gk, N]  (per-col, per-32 K-group)
+    m0: int, n0: int, k0: int,
+    TM: int, TN: int,
+    group: int,
+    scale_spec: str = "fpe8m0",
+) -> Tensor:
+    """
+    Build S_tile (TM x TN) for this tile using outer product:
+      sA_vec[i] = A_scales_row[m0+i, g]
+      sB_vec[j] = B_scales_col[g, n0+j]
+      S_tile[i,j] = sA_vec[i] * sB_vec[j]
+    where g = k0 // group.
+
+    Returned S_tile is quantized to scale_spec (e.g., fpe8m0).
+    """
+    g = k0 // group
+    sA = A_scales_row[m0:m0+TM, g].to(torch.float32)   # [TM]
+    sB = B_scales_col[g, n0:n0+TN].to(torch.float32)   # [TN]
+    S = torch.outer(sA, sB)                            # [TM, TN]
+
+    S_q = make_fp_quantizer(scale_spec, "nearest")(S)  # e8m0 in your case
+    return S_q
+
+
+def bf16_accum_add(x: Tensor, y: Tensor) -> Tensor:
+    # BF16 add with rounding to BF16
+    return q_bf16_rne(q_bf16_rne(x) + q_bf16_rne(y))
+
+
+def tiled_matmul_scaled_accum_hwlike(
+    A_in: Tensor, B_in: Tensor,
+    *,
+    prod_quant: QuantFn,
+    A_scales_row: Tensor,     # [M, Gk]
+    B_scales_col: Tensor,     # [Gk, N]
+    tile: int = 16,
+    group: int = 32,
+    scale_spec: str = "fpe8m0",
+    trace_tiles: Optional[List[Tuple[int,int,int]]] = None,  # list of (m0,n0,k0)
+    trace_max: int = 8,
+) -> Tuple[Tensor, Dict]:
+    """
+    Full tiled GEMM:
+      for m0,n0,k0 in tiles:
+        C_tile_bf16 = systolic-like outer-product MAC (bf16 rounding each add)
+        S_tile_q    = outer(row_scales, col_scales) quantized to scale_spec
+        C_tile_scaled_bf16 = bf16( C_tile_bf16 * S_tile_q )
+        C_out = bf16( C_out + C_tile_scaled_bf16 )
+
+    Returns:
+      C_out (bf16 grid in fp32 tensor),
+      debug dict containing optional per-tile dumps.
+    """
+    M, K = A_in.shape
+    K2, N = B_in.shape
+    assert K == K2
+
+    TM = TN = TK = tile
+    assert M % TM == 0 and N % TN == 0 and K % TK == 0, \
+        "For now require M,N,K multiples of tile=16 (easy to relax later)."
+    assert group % TK == 0, "group (32) should be multiple of TK (16) for your reuse rule."
+
+    Gk = (K + group - 1) // group
+    assert A_scales_row.shape == (M, Gk)
+    assert B_scales_col.shape == (Gk, N)
+
+    C_out = torch.zeros((M, N), dtype=torch.float32, device=A_in.device)
+
+    debug = {"tiles": []}
+    traced = 0
+
+    def should_trace(m0,n0,k0):
+        nonlocal traced
+        if trace_tiles is not None:
+            return (m0,n0,k0) in trace_tiles
+        return traced < trace_max
+
+    for m0 in range(0, M, TM):
+        for n0 in range(0, N, TN):
+            for k0 in range(0, K, TK):
+                A_tile = A_in[m0:m0+TM, k0:k0+TK]  # [16,16]
+                B_tile = B_in[k0:k0+TK, n0:n0+TN]  # [16,16]
+
+                # 1) tile MAC (bf16 after each add inside)
+                C_tile = matmul_outer_quantized_hwlike(
+                    A_tile, B_tile,
+                    prod_quant=prod_quant,
+                    acc_each_add=True
+                )  # returns fp32 tensor on bf16 grid
+
+                # 2) scale tile (outer product scales, quantized to scale_spec)
+                S_tile_q = compute_tile_scale_matrix_fpe8m0(
+                    A_scales_row, B_scales_col,
+                    m0=m0, n0=n0, k0=k0,
+                    TM=TM, TN=TN,
+                    group=group,
+                    scale_spec=scale_spec
+                )
+
+                # 3) scale down and keep bf16
+                C_tile_scaled = q_bf16_rne(C_tile * S_tile_q)
+
+                # 4) accumulate into output in bf16 each tile-add
+                C_prev = C_out
+                C_out = bf16_accum_add(C_out, C_tile_scaled)
+
+                # optional tracing
+                if should_trace(m0,n0,k0):
+                    traced += 1
+                    print(f"\n=== TILE (m0={m0}, n0={n0}, k0={k0}) g={k0//group} ===")
+                    print("A_tile:")
+                    print(A_tile.detach().cpu().numpy())
+                    print("B_tile:")
+                    print(B_tile.detach().cpu().numpy())
+                    print("C_tile (bf16 grid):")
+                    print(C_tile.detach().cpu().numpy())
+                    print(f"S_tile_q ({scale_spec}):")
+                    print(S_tile_q.detach().cpu().numpy())
+                    print("C_tile_scaled (bf16):")
+                    print(C_tile_scaled.detach().cpu().numpy())
+                    print("C_out before add (bf16 grid):")
+                    print(q_bf16_rne(C_prev).detach().cpu().numpy())
+                    print("C_out after add (bf16 grid):")
+                    print(C_out.detach().cpu().numpy())
+
+                    debug["tiles"].append({
+                        "m0": m0, "n0": n0, "k0": k0, "g": k0//group,
+                        "A_tile": A_tile.detach().cpu(),
+                        "B_tile": B_tile.detach().cpu(),
+                        "C_tile": C_tile.detach().cpu(),
+                        "S_tile_q": S_tile_q.detach().cpu(),
+                        "C_tile_scaled": C_tile_scaled.detach().cpu(),
+                        "C_out": C_out.detach().cpu(),
+                    })
+
+    return C_out, debug
 
 def matmul_loss(C_ref: Tensor, C_quant: Tensor) -> Dict[str, float]:
     diff = (C_quant - C_ref).detach()
@@ -451,6 +589,67 @@ def write_c_header(
 
         f.write(f"#endif // {guard}\n")
 
+def write_c_header_tiled(
+    path: str,
+    M: int, K: int, N: int,
+    input_spec: str,
+    acc_spec: str,
+    scale_spec: str,
+    A_in: Tensor,
+    B_in: Tensor,
+    A_scales_row_q: Tensor,   # [M, Gk]
+    B_scales_col_q: Tensor,   # [Gk, N]
+    C_out_bf16: Tensor,       # [M, N] (bf16 grid stored as fp32)
+):
+    # encode A/B in input_spec, scales in scale_spec, output in bf16
+    A_codes, A_bits = tensor_to_custom_fp_codes(A_in, input_spec)
+    B_codes, B_bits = tensor_to_custom_fp_codes(B_in, input_spec)
+    As_codes, As_bits = tensor_to_custom_fp_codes(A_scales_row_q, scale_spec)
+    Bs_codes, Bs_bits = tensor_to_custom_fp_codes(B_scales_col_q, scale_spec)
+    C_codes, C_bits = tensor_to_custom_fp_codes(C_out_bf16, "bf16")
+
+    guard = path.upper()
+    for ch in [".", "/", "\\", "-"]:
+        guard = guard.replace(ch, "_")
+
+    # store A in u16, B in u32 like you already do
+    A_store_bits, B_store_bits = 16, 32
+    A_codes_store = zext_codes(A_codes, A_store_bits)
+    B_codes_store = zext_codes(B_codes, B_store_bits)
+
+    A_hex = codes_to_hex_rows(A_codes_store, A_store_bits)
+    B_hex = codes_to_hex_rows(B_codes_store, B_store_bits)
+    As_hex = codes_to_hex_rows(As_codes, As_bits)
+    Bs_hex = codes_to_hex_rows(Bs_codes, Bs_bits)
+    C_hex  = codes_to_hex_rows(C_codes, C_bits)
+
+    def format_2d_array(hex_rows: List[List[str]]) -> str:
+        lines = []
+        for row in hex_rows:
+            line = ", ".join(f"0x{h}" for h in row)
+            lines.append("    { " + line + " }")
+        return ",\n".join(lines)
+
+    with open(path, "w") as f:
+        f.write(f"#ifndef {guard}\n#define {guard}\n\n")
+        f.write("#include <stdint.h>\n\n")
+        f.write(f"#define MATMUL_M {M}\n#define MATMUL_K {K}\n#define MATMUL_N {N}\n")
+        f.write(f"#define MATMUL_GK {(K + 32 - 1)//32}\n\n")
+
+        f.write(f"// Input precision: {input_spec}\n")
+        f.write(f"static const uint16_t A_in[MATMUL_M][MATMUL_K] = {{\n{format_2d_array(A_hex)}\n}};\n\n")
+        f.write(f"static const uint32_t B_in[MATMUL_K][MATMUL_N] = {{\n{format_2d_array(B_hex)}\n}};\n\n")
+
+        f.write(f"// Per-row per-32-K-group scales in {scale_spec}\n")
+        f.write(f"static const {c_type_for_bits(As_bits)} A_scales_row[MATMUL_M][MATMUL_GK] = {{\n{format_2d_array(As_hex)}\n}};\n\n")
+
+        f.write(f"// Per-col per-32-K-group scales in {scale_spec}\n")
+        f.write(f"static const {c_type_for_bits(Bs_bits)} B_scales_col[MATMUL_GK][MATMUL_N] = {{\n{format_2d_array(Bs_hex)}\n}};\n\n")
+
+        f.write("// Final output (already scaled+accumulated), bf16\n")
+        f.write(f"static const uint16_t C_out[MATMUL_M][MATMUL_N] = {{\n{format_2d_array(C_hex)}\n}};\n\n")
+        f.write(f"#endif // {guard}\n")
+
 # ----------------------------------------------------------------------
 # Single experiment: generate A,B, quantize, run matmul, print everything
 # ----------------------------------------------------------------------
@@ -462,266 +661,243 @@ def run_experiment(
     input_spec: str,
     prod_spec: str,
     acc_spec: str,
-    scaled_spec: Optional[str] = None,
+    scaled_spec: Optional[str] = None,          # ignored (kept for signature compatibility)
     input_rounding: str = "nearest",
     prod_rounding: str = "nearest",
-    acc_rounding: str = "nearest",
+    acc_rounding: str = "q_bf16_rne",           # you want bf16 grid behavior
     scale_spec: str = "fpe8m0",
-    scale_exp: int = 0,
+    scale_exp: int = 0,                         # optional global multiplier (applied to scale vectors)
     header_path: str = "matmul_data.h",
     seed: int = 0,
     device: str = "cpu",
+    *,
+    tile: int = 16,
+    group: int = 32,
+    trace_tiles: Optional[List[Tuple[int,int,int]]] = None,
+    trace_max: int = 4,
+    print_inputs_fp32: bool = False,
+    print_inputs_quant: bool = True,
+    print_hex_inputs: bool = True,
 ):
+    """
+    Tiled-only golden model:
+
+    - Inputs: A,B generated FP32 -> quantized to input_spec (fp8)
+    - Scales:
+        A_scales_row_q: [M, Gk]   per-row per-32-K-group (fpE8M0)
+        B_scales_col_q: [Gk, N]   per-col per-32-K-group (fpE8M0)
+      Tile scale matrix S_tile = outer(A_scales_row_q[:,g], B_scales_col_q[g,:])
+    - For each (m0,n0,k0) tile:
+        C_tile_bf16 = matmul_outer_quantized_hwlike(A_tile,B_tile,prod_quant, bf16 each add)
+        S_tile_q    = outer-product scales (quantized to scale_spec)
+        C_tile_scaled_bf16 = bf16(C_tile_bf16 * S_tile_q)
+        C_out = bf16(C_out + C_tile_scaled_bf16)
+    - Writes one header using write_c_header_tiled().
+
+    Notes:
+    - Requires M,N,K multiples of 16 (tile).
+    - group=32 means tiles at k0=0 and k0=16 share the same scale group.
+    """
+
+    # ------------------------------------------------------------------
+    # setup / inputs
+    # ------------------------------------------------------------------
     torch.manual_seed(seed)
     dev = torch.device(device if (device == "cpu" or torch.cuda.is_available()) else "cpu")
 
-    if scaled_spec is None:
-        scaled_spec = prod_spec  # default: shrink back to same FP8 as product
+    assert M % tile == 0 and N % tile == 0 and K % tile == 0, \
+        f"Require M,N,K multiples of tile={tile} for now."
+    assert group % tile == 0, f"Require group ({group}) multiple of tile ({tile})."
 
-    # Generate random inputs
     A = torch.randn(M, K, device=dev, dtype=torch.float32)
     B = torch.randn(K, N, device=dev, dtype=torch.float32)
 
-    print("=== Configuration ===")
-    print(f"M={M}, K={K}, N={N}")
+    print("=== Configuration (TILED MODE) ===")
+    print(f"M={M}, K={K}, N={N}, tile={tile}, group={group}")
     print(f"input_spec={input_spec}, input_rounding={input_rounding}")
     print(f"prod_spec={prod_spec}, prod_rounding={prod_rounding}")
     print(f"acc_spec={acc_spec}, acc_rounding={acc_rounding}")
-    print(f"scaled_spec={scaled_spec} (post-scale output FP8)")
-    print(f"scale_spec={scale_spec}, scale_exp={scale_exp}")
+    print(f"scale_spec={scale_spec}, scale_exp(global_mult)={scale_exp}")
     print(f"header_path={header_path}")
     print(f"device={dev}, seed={seed}")
     print()
 
-    print("=== Full-precision Inputs (FP32) ===")
-    print("A_fp32:")
-    print(A.detach().cpu().numpy())
-    print("\nB_fp32:")
-    print(B.detach().cpu().numpy())
-    print()
-
-    # Build quantizers
-    in_q   = make_fp_quantizer(input_spec, rounding=input_rounding)
-    if args.prod_mant_bits is not None:
-        prod_q = lambda t: trunc_product_mantissa(t, frac_bits=args.prod_mant_bits)
-        print(f"Product quantization: mantissa chopped to {args.prod_mant_bits} fraction bits")
-    else:
-        prod_q = make_fp_quantizer(prod_spec, rounding=prod_rounding)
-    acc_q  = q_bf16_rne if acc_rounding == "q_bf16_rne" else make_fp_quantizer(acc_spec,   rounding=acc_rounding)
-    # Post-scale FP8 quantizer uses nearest-even
-    scaled_q = make_fp_quantizer(scaled_spec, rounding="nearest_even")
-
-    # Quantize inputs to input precision (for storage / feeding MAC)
-    A_in = in_q(A) if in_q is not None else A
-    B_in = in_q(B) if in_q is not None else B
-
-    print("\n=== TRACE C[0,0] with product mantissa chopped to 8 bits ===")
-    _ = trace_dot(
-        A_in, B_in, 0, 0,
-        prod_quant=lambda t: trunc_product_mantissa(t, frac_bits=8),
-        acc_quant=acc_q,
-        cast_prod=True,
-        cast_each_add=True,   # if you quantize accumulator each cycle
-        verbose=True,
-    )
-
-    print("=== Inputs quantized to input precision ===")
-    print(f"A_in (float, {input_spec}, rounding={input_rounding}):")
-    print(A_in.detach().cpu().numpy())
-    print()
-    print(f"B_in (float, {input_spec}, rounding={input_rounding}):")
-    print(B_in.detach().cpu().numpy())
-    print()
-
-    # Hex dump of quantized inputs (input format, e.g. fp8)
-    try:
-        A_codes, A_bits = tensor_to_custom_fp_codes(A_in, input_spec)
-        B_codes, B_bits = tensor_to_custom_fp_codes(B_in, input_spec)
-        A_hex = codes_to_hex_rows(A_codes, A_bits)
-        B_hex = codes_to_hex_rows(B_codes, B_bits)
-
-        print(f"=== A_in hex encoding ({input_spec}) ===")
-        for row in A_hex:
-            print(" ".join(row))
-        print()
-        print(f"=== B_in hex encoding ({input_spec}) ===")
-        for row in B_hex:
-            print(" ".join(row))
-        print()
-    except ValueError as e:
-        print(f"[WARN] Could not hex-encode inputs for {input_spec}: {e}")
-        A_codes = B_codes = []
-        A_bits = B_bits = 0
+    if print_inputs_fp32:
+        print("=== Full-precision Inputs (FP32) ===")
+        print("A_fp32:")
+        print(A.detach().cpu().numpy())
+        print("\nB_fp32:")
+        print(B.detach().cpu().numpy())
         print()
 
     # ------------------------------------------------------------------
-    # Reference 1: Fully ideal FP32 (unquantized inputs)
+    # quantizers
+    # ------------------------------------------------------------------
+    in_q = make_fp_quantizer(input_spec, rounding=input_rounding)
+
+    # Product quantization:
+    # - If you are using --prod-mant-bits, keep the global 'args' usage.
+    #   Otherwise use prod_spec quantizer.
+    if "args" in globals() and getattr(args, "prod_mant_bits", None) is not None:
+        prod_q = lambda t: trunc_product_mantissa(t, frac_bits=args.prod_mant_bits)
+        print(f"Product quantization: mantissa chopped to {args.prod_mant_bits} fraction bits (RTZ/chop)")
+    else:
+        prod_q = make_fp_quantizer(prod_spec, rounding=prod_rounding)
+
+    # Accumulator quantization: you want BF16 grid after each add
+    if acc_rounding == "q_bf16_rne":
+        acc_q = q_bf16_rne
+    else:
+        # if you ever want a different acc_spec model
+        acc_q = make_fp_quantizer(acc_spec, rounding=acc_rounding)
+
+    # Quantize inputs to storage/compute format
+    A_in = in_q(A) if in_q is not None else A
+    B_in = in_q(B) if in_q is not None else B
+
+    if print_inputs_quant:
+        print("=== Inputs quantized to input precision ===")
+        print(f"A_in (float, {input_spec}, rounding={input_rounding}):")
+        print(A_in.detach().cpu().numpy())
+        print()
+        print(f"B_in (float, {input_spec}, rounding={input_rounding}):")
+        print(B_in.detach().cpu().numpy())
+        print()
+
+    # Optional hex dump of input encodings
+    A_codes = B_codes = None
+    A_bits = B_bits = None
+    if print_hex_inputs:
+        try:
+            A_codes, A_bits = tensor_to_custom_fp_codes(A_in, input_spec)
+            B_codes, B_bits = tensor_to_custom_fp_codes(B_in, input_spec)
+            A_hex = codes_to_hex_rows(A_codes, A_bits)
+            B_hex = codes_to_hex_rows(B_codes, B_bits)
+
+            print(f"=== A_in hex encoding ({input_spec}) ===")
+            for row in A_hex[:min(8, len(A_hex))]:
+                print(" ".join(row))
+            if len(A_hex) > 8:
+                print("... (truncated)")
+            print()
+
+            print(f"=== B_in hex encoding ({input_spec}) ===")
+            for row in B_hex[:min(8, len(B_hex))]:
+                print(" ".join(row))
+            if len(B_hex) > 8:
+                print("... (truncated)")
+            print()
+        except ValueError as e:
+            print(f"[WARN] Could not hex-encode inputs for {input_spec}: {e}")
+            print()
+
+    # ------------------------------------------------------------------
+    # build scale vectors (placeholder; swap with real extraction later)
+    # ------------------------------------------------------------------
+    Gk = (K + group - 1) // group
+
+    # deterministic but different from A/B
+    torch.manual_seed(seed + 123)
+
+    # Make power-of-two exponents for fpE8M0 friendliness
+    A_scale_exp = torch.randint(low=-4, high=4, size=(M, Gk), device=dev)
+    B_scale_exp = torch.randint(low=-4, high=4, size=(Gk, N), device=dev)
+
+    A_scales_row = torch.pow(2.0, A_scale_exp.to(torch.float32))
+    B_scales_col = torch.pow(2.0, B_scale_exp.to(torch.float32))
+
+    # Optional global multiplier (also power-of-two)
+    if scale_exp != 0:
+        global_mult = float(2.0 ** scale_exp)
+        A_scales_row = A_scales_row * global_mult
+        # (or distribute across A/B however you want; this keeps behavior simple)
+
+    # Quantize to scale_spec (fpe8m0)
+    A_scales_row_q = make_fp_quantizer(scale_spec, "nearest")(A_scales_row)
+    B_scales_col_q = make_fp_quantizer(scale_spec, "nearest")(B_scales_col)
+
+    print("=== A_scales_row_q (per-row per-32-K-group) ===")
+    print(A_scales_row_q.detach().cpu().numpy())
+    print()
+    print("=== B_scales_col_q (per-col per-32-K-group) ===")
+    print(B_scales_col_q.detach().cpu().numpy())
+    print()
+
+    # ------------------------------------------------------------------
+    # references (optional but useful): full FP32 and input-quantized FP32
     # ------------------------------------------------------------------
     t0 = time.perf_counter()
     C_ref_full = matmul_outer(A, B)
     t1 = time.perf_counter()
-
-    print("=== Reference Output 1: FP32 matmul, FP32 inputs ===")
-    print("C_ref_full:")
-    print(C_ref_full.detach().cpu().numpy())
-    print(f"(ref_full matmul time: {t1 - t0:.6f} s)")
+    print("=== Reference: FP32 matmul, FP32 inputs ===")
+    print(f"(time: {t1 - t0:.6f} s)")
     print()
 
-    # ------------------------------------------------------------------
-    # Reference 2: FP32 matmul, but with input-quantized inputs
-    # (ideal product+accumulator precision, but quantized inputs)
-    # ------------------------------------------------------------------
     t2 = time.perf_counter()
     C_ref_in = matmul_outer(A_in, B_in)
     t3 = time.perf_counter()
-
-    print("=== Reference Output 2: FP32 matmul, input-quantized inputs ===")
-    print(f"C_ref_in (inputs in {input_spec}, ideal MAC):")
-    print(C_ref_in.detach().cpu().numpy())
-    print(f"(ref_in matmul time: {t3 - t2:.6f} s)")
+    print(f"=== Reference: FP32 matmul, input-quantized inputs ({input_spec}) ===")
+    print(f"(time: {t3 - t2:.6f} s)")
     print()
 
     # ------------------------------------------------------------------
-    # Quantized MAC matmul: product+acc quantization (hardware-like)
+    # tiled quantized matmul + tile scale + bf16 accumulation
     # ------------------------------------------------------------------
     t4 = time.perf_counter()
-    C_quant = matmul_outer_quantized_hwlike(
+    C_out_bf16, debug = tiled_matmul_scaled_accum_hwlike(
         A_in, B_in,
-        prod_quant=prod_q,     # keep your existing mul model
-        acc_each_add=True
+        prod_quant=prod_q,
+        A_scales_row=A_scales_row_q,
+        B_scales_col=B_scales_col_q,
+        tile=tile,
+        group=group,
+        scale_spec=scale_spec,
+        trace_tiles=trace_tiles,
+        trace_max=trace_max,
     )
     t5 = time.perf_counter()
 
-    print("=== Quantized Output: product+acc quantization ===")
-    print(f"C_quant (acc_spec={acc_spec}, rounding={acc_rounding}):")
-    print(C_quant.detach().cpu().numpy())
-    print(f"(quantized matmul time: {t5 - t4:.6f} s)")
+    print("=== Output: TILED quantized, scaled per-tile, accumulated in bf16 ===")
+    print("C_out_bf16:")
+    print(C_out_bf16.detach().cpu().numpy())
+    print(f"(time: {t5 - t4:.6f} s)")
     print()
 
-    # Hex dump of output in accumulator format (e.g. bf16)
-    try:
-        C_codes, C_bits = tensor_to_custom_fp_codes(C_quant, acc_spec)
-        C_hex = codes_to_hex_rows(C_codes, C_bits)
-        print(f"=== C_quant hex encoding ({acc_spec}) ===")
-        for row in C_hex:
-            print(" ".join(row))
-        print()
-    except ValueError as e:
-        print(f"[WARN] Could not hex-encode output for {acc_spec}: {e}")
-        C_codes = []
-        C_bits = 0
-        print()
-
     # ------------------------------------------------------------------
-    # Scaling factors (elementwise) in fpE8M0 (scale_spec)
+    # error metrics (against useful references)
     # ------------------------------------------------------------------
-    scale_val = float(2.0 ** scale_exp)
-    S = torch.full_like(C_quant, scale_val)
+    metrics_vs_full = matmul_loss(C_ref_full, C_out_bf16)
+    metrics_vs_in   = matmul_loss(C_ref_in,   C_out_bf16)
 
-    print(f"=== Scaling factors (float, {scale_spec}, before quantization) ===")
-    print(S.detach().cpu().numpy())
-    print()
-
-    # Quantize scaling factors to scale_spec
-    S_q = make_fp_quantizer(scale_spec, "nearest")(S)  # scale usually nearest-even/nearest is fine
-
-    try:
-        S_codes, S_bits = tensor_to_custom_fp_codes(S_q, scale_spec)
-        S_hex = codes_to_hex_rows(S_codes, S_bits)
-        print(f"=== Scaling factors hex encoding ({scale_spec}) ===")
-        for row in S_hex:
-            print(" ".join(row))
-        print()
-    except ValueError as e:
-        print(f"[WARN] Could not hex-encode scaling factors for {scale_spec}: {e}")
-        S_codes = []
-        S_bits = 0
-        print()
-
-    # ------------------------------------------------------------------
-    # Apply scaling (elementwise): C_scaled_pre_q = C_quant * S_q
-    # Then quantize scaled outputs to FP8 (scaled_spec) with nearest-even
-    # ------------------------------------------------------------------
-    C_scaled_pre_q = C_quant * S_q
-
-    print("=== Output before scaling (C_quant) ===")
-    print(C_quant.detach().cpu().numpy())
-    print()
-
-    print("=== Output after scaling (float, before re-quantization to FP8) ===")
-    print(C_scaled_pre_q.detach().cpu().numpy())
-    print()
-
-    # Quantize scaled outputs to BF16 (this is what you want to export)
-    C_scaled_bf16 = q_bf16_rne(C_scaled_pre_q)
-
-    print("=== Output after scaling, quantized to BF16 (RNE) ===")
-    print(C_scaled_bf16.detach().cpu().numpy())
-    print()
-
-    # Hex dump of scaled outputs as BF16
-    try:
-        C_scaled_codes, C_scaled_bits = tensor_to_custom_fp_codes(C_scaled_bf16, "bf16")
-        C_scaled_hex = codes_to_hex_rows(C_scaled_codes, C_scaled_bits)
-        print("=== C_scaled hex encoding (bf16) ===")
-        for row in C_scaled_hex:
-            print(" ".join(row))
-        print()
-    except ValueError as e:
-        print(f"[WARN] Could not hex-encode scaled outputs for bf16: {e}")
-        C_scaled_codes = []
-        C_scaled_bits = 0
-        print()
-
-    # ------------------------------------------------------------------
-    # Error metrics (on C_quant; you can add for C_scaled if needed)
-    # ------------------------------------------------------------------
-    metrics_vs_full   = matmul_loss(C_ref_full,  C_quant)
-    metrics_vs_in     = matmul_loss(C_ref_in,    C_quant)
-    metrics_in_vs_full = matmul_loss(C_ref_full, C_ref_in)
-
-    print("=== Error metrics: C_quant vs C_ref_full (FP32 inputs) ===")
+    print("=== Error metrics: C_out_bf16 vs C_ref_full (FP32 inputs) ===")
     for k, v in metrics_vs_full.items():
         print(f"{k}: {v:.6e}")
     print()
 
-    print("=== Error metrics: C_quant vs C_ref_in (input-quantized, ideal MAC) ===")
+    print(f"=== Error metrics: C_out_bf16 vs C_ref_in (input-quantized, ideal MAC) ===")
     for k, v in metrics_vs_in.items():
         print(f"{k}: {v:.6e}")
     print()
 
-    print("=== Error metrics: C_ref_in vs C_ref_full (pure input quantization error) ===")
-    for k, v in metrics_in_vs_full.items():
-        print(f"{k}: {v:.6e}")
-    print()
-
     # ------------------------------------------------------------------
-    # Write C header with hex-encoded A_in, B_in, C_quant, S_q, C_scaled
+    # output header (single writer; do NOT call the old write_c_header)
     # ------------------------------------------------------------------
-    if A_codes and B_codes and C_codes and S_codes and C_scaled_codes:
-        write_c_header(
+    try:
+        write_c_header_tiled(
             path=header_path,
-            M=M,
-            K=K,
-            N=N,
+            M=M, K=K, N=N,
             input_spec=input_spec,
             acc_spec=acc_spec,
             scale_spec=scale_spec,
-            scaled_spec=scaled_spec,
-            A_codes=A_codes,
-            A_bits=A_bits,
-            B_codes=B_codes,
-            B_bits=B_bits,
-            C_codes=C_codes,
-            C_bits=C_bits,
-            S_codes=S_codes,
-            S_bits=S_bits,
-            C_scaled_codes=C_scaled_codes,
-            C_scaled_bits=C_scaled_bits,
+            A_in=A_in,
+            B_in=B_in,
+            A_scales_row_q=A_scales_row_q,
+            B_scales_col_q=B_scales_col_q,
+            C_out_bf16=C_out_bf16,
         )
         print(f"Header written to: {header_path}")
-    else:
-        print("[WARN] Header not written because some codes/bits are missing (see warnings above).")
+    except Exception as e:
+        print(f"[WARN] Failed to write tiled header: {e}")
 
 def trace_dot(
     A_in: Tensor,
