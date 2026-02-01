@@ -218,16 +218,15 @@ def make_fp_quantizer(spec: str, rounding: str = "nearest") -> QuantFn:
     raise ValueError(f"Unsupported rounding mode: {rounding}")
 
 
-def make_lut(spec: str, index_bits: int, dev: torch.device, force_zero: bool = True, attempts: int = 1024) -> Tensor:
+def make_lut(spec: str, index_bits: int, dev: torch.device, attempts: int = 1024) -> Tensor:
     elem_count = 1 << index_bits
     fp_quantizer = make_fp_quantizer(spec)
     vals = torch.randn(attempts, dtype=torch.float32)
-    qvals = fp_quantizer(vals).cpu().detach().tolist()
-    lut = []
-    if force_zero:
-        lut.append(0.0)
-    for v in qvals:
-        if v not in lut:
+    qvals = fp_quantizer(vals)
+    codes, _ = tensor_to_custom_fp_codes(qvals.unsqueeze(-1), spec)
+    lut = [0.0] # Always include zero
+    for v, code in zip(qvals.cpu().detach().tolist(), codes):
+        if v not in lut and code[0] != 0:
             lut.append(v)
         if len(lut) == elem_count:
             break
@@ -630,16 +629,24 @@ def write_c_header_tiled(
     A_scales_row_q: Tensor,   # [M, Gk]
     B_scales_col_q: Tensor,   # [Gk, N]
     C_out_bf16: Tensor,       # [M, N] (bf16 grid stored as fp32)
+    A_lut: Tensor | None = None,
+    B_lut: Tensor | None = None,
 ):
+    print(A_lut)
     # encode A/B in input_spec, scales in scale_spec, output in bf16
     if lut_index_bits >= 0:
         A_codes = A_in.tolist()
         B_codes = B_in.tolist()
         A_bits = lut_index_bits
         B_bits = lut_index_bits
+        A_lut_codes, A_lut_bits = tensor_to_custom_fp_codes(A_lut.unsqueeze(-1), input_spec)
+        B_lut_codes, B_lut_bits = tensor_to_custom_fp_codes(B_lut.unsqueeze(-1), input_spec)
+        A_lut_hex = codes_to_hex_rows(A_lut_codes, A_lut_bits)
+        B_lut_hex = codes_to_hex_rows(B_lut_codes, B_lut_bits)
     else:
         A_codes, A_bits = tensor_to_custom_fp_codes(A_in, input_spec)
         B_codes, B_bits = tensor_to_custom_fp_codes(B_in, input_spec)
+        
     As_codes, As_bits = tensor_to_custom_fp_codes(A_scales_row_q, scale_spec)
     Bs_codes, Bs_bits = tensor_to_custom_fp_codes(B_scales_col_q, scale_spec)
     C_codes, C_bits = tensor_to_custom_fp_codes(C_out_bf16, "bf16")
@@ -681,6 +688,11 @@ def write_c_header_tiled(
         f.write("\n")
         f.write(f"static const {c_type_for_bits(A_bits)} A_in[MATMUL_M][MATMUL_K{' / 2' if A_bits <= 4 else ''}] = {{\n{format_2d_array(A_hex)}\n}};\n\n")
         f.write(f"static const {c_type_for_bits(B_bits)} B_in[MATMUL_K][MATMUL_N{' / 2' if B_bits <= 4 else ''}] = {{\n{format_2d_array(B_hex)}\n}};\n\n")
+
+        if lut_index_bits >= 0:
+            f.write("// Lookup tables\n")
+            f.write(f"static const {c_type_for_bits(A_lut_bits)} A_lut[{1 << lut_index_bits}] = {{\n    {(', '.join([f'0x{e[0]}' for e in A_lut_hex]))}\n}};\n\n")
+            # f.write(f"static const {c_type_for_bits(B_lut_bits)} B_lut[{1 << lut_index_bits}] = {{\n{format_2d_array(B_lut_hex)}\n}};\n\n")
 
         f.write(f"// Per-row per-32-K-group scales in {scale_spec}\n")
         f.write(f"static const {c_type_for_bits(As_bits)} A_scales_row[MATMUL_M][MATMUL_GK] = {{\n{format_2d_array(As_hex)}\n}};\n\n")
@@ -950,6 +962,8 @@ def run_experiment(
             A_scales_row_q=A_scales_row_q,
             B_scales_col_q=B_scales_col_q,
             C_out_bf16=C_out_bf16,
+            A_lut=A_lut if use_lut else None,
+            B_lut=B_lut if use_lut else None,
         )
         print(f"Header written to: {header_path}")
     except Exception as e:
