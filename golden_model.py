@@ -18,6 +18,8 @@ _FP_PRESETS = {
     "bf16":      dict(exp=8, man=7),
     "fp8:e4m3":  dict(exp=4, man=3),
     "fp8:e5m2":  dict(exp=5, man=2),
+    "fp6:e3m2":  dict(exp=3, man=2),
+    "fp4:e4m1":  dict(exp=2, man=1),
 
     # Experimental / custom
     "fp26":      dict(exp=7, man=18),
@@ -214,6 +216,33 @@ def make_fp_quantizer(spec: str, rounding: str = "nearest") -> QuantFn:
         return lambda x: float_quantize_trunc(x, exp=e, man=m)
 
     raise ValueError(f"Unsupported rounding mode: {rounding}")
+
+
+def make_lut(spec: str, index_bits: int, dev: torch.device, force_zero: bool = True, attempts: int = 1024) -> Tensor:
+    elem_count = 1 << index_bits
+    fp_quantizer = make_fp_quantizer(spec)
+    vals = torch.randn(attempts, dtype=torch.float32)
+    qvals = fp_quantizer(vals).cpu().detach().tolist()
+    lut = []
+    if force_zero:
+        lut.append(0.0)
+    for v in qvals:
+        if v not in lut:
+            lut.append(v)
+        if len(lut) == elem_count:
+            break
+    if len(lut) != elem_count:
+        lut.extend([0.0] for i in range(elem_count - len(lut)))
+    return torch.tensor(lut, device=dev, dtype=torch.float32)
+
+
+def quantize_lut_indices(lut: Tensor, t: Tensor) -> Tensor:
+    difference = t.unsqueeze(-1) - lut
+    return difference.abs().argmin(dim=-1)
+
+
+def lut_lookup(lut: Tensor, i: Tensor) -> Tensor:
+    return lut[i]
 
 
 def tensor_to_custom_fp_codes(t: Tensor, spec: str) -> Tuple[List[List[int]], int]:
@@ -595,6 +624,7 @@ def write_c_header_tiled(
     input_spec: str,
     acc_spec: str,
     scale_spec: str,
+    lut_index_bits: int,
     A_in: Tensor,
     B_in: Tensor,
     A_scales_row_q: Tensor,   # [M, Gk]
@@ -602,23 +632,32 @@ def write_c_header_tiled(
     C_out_bf16: Tensor,       # [M, N] (bf16 grid stored as fp32)
 ):
     # encode A/B in input_spec, scales in scale_spec, output in bf16
-    A_codes, A_bits = tensor_to_custom_fp_codes(A_in, input_spec)
-    B_codes, B_bits = tensor_to_custom_fp_codes(B_in, input_spec)
+    if lut_index_bits >= 0:
+        A_codes = A_in.tolist()
+        B_codes = B_in.tolist()
+        A_bits = lut_index_bits
+        B_bits = lut_index_bits
+    else:
+        A_codes, A_bits = tensor_to_custom_fp_codes(A_in, input_spec)
+        B_codes, B_bits = tensor_to_custom_fp_codes(B_in, input_spec)
     As_codes, As_bits = tensor_to_custom_fp_codes(A_scales_row_q, scale_spec)
     Bs_codes, Bs_bits = tensor_to_custom_fp_codes(B_scales_col_q, scale_spec)
     C_codes, C_bits = tensor_to_custom_fp_codes(C_out_bf16, "bf16")
+    # Scale factors are unsigned
+    As_bits -= 1
+    Bs_bits -= 1
 
     guard = path.upper()
     for ch in [".", "/", "\\", "-"]:
         guard = guard.replace(ch, "_")
 
-    # store A in u16, B in u32 like you already do
-    A_store_bits, B_store_bits = 16, 32
-    A_codes_store = zext_codes(A_codes, A_store_bits)
-    B_codes_store = zext_codes(B_codes, B_store_bits)
-
-    A_hex = codes_to_hex_rows(A_codes_store, A_store_bits)
-    B_hex = codes_to_hex_rows(B_codes_store, B_store_bits)
+    if A_bits <= 4:
+        A_codes = [[((r[i + 1] << 4) | r[i]) for i in range(0, len(r), 2)] for r in A_codes]
+    if B_bits <= 4:
+        B_codes = [[((r[i + 1] << 4) | r[i]) for i in range(0, len(r), 2)] for r in B_codes]
+    
+    A_hex = codes_to_hex_rows(A_codes, A_bits)
+    B_hex = codes_to_hex_rows(B_codes, B_bits)
     As_hex = codes_to_hex_rows(As_codes, As_bits)
     Bs_hex = codes_to_hex_rows(Bs_codes, Bs_bits)
     C_hex  = codes_to_hex_rows(C_codes, C_bits)
@@ -636,9 +675,12 @@ def write_c_header_tiled(
         f.write(f"#define MATMUL_M {M}\n#define MATMUL_K {K}\n#define MATMUL_N {N}\n")
         f.write(f"#define MATMUL_GK {(K + 32 - 1)//32}\n\n")
 
-        f.write(f"// Input precision: {input_spec}\n")
-        f.write(f"static const uint16_t A_in[MATMUL_M][MATMUL_K] = {{\n{format_2d_array(A_hex)}\n}};\n\n")
-        f.write(f"static const uint32_t B_in[MATMUL_K][MATMUL_N] = {{\n{format_2d_array(B_hex)}\n}};\n\n")
+        f.write(f"// Input precision: {input_spec}")
+        if lut_index_bits >= 0:
+            f.write(f" ({lut_index_bits}-bit int LUT indices)")
+        f.write("\n")
+        f.write(f"static const {c_type_for_bits(A_bits)} A_in[MATMUL_M][MATMUL_K{' / 2' if A_bits <= 4 else ''}] = {{\n{format_2d_array(A_hex)}\n}};\n\n")
+        f.write(f"static const {c_type_for_bits(B_bits)} B_in[MATMUL_K][MATMUL_N{' / 2' if B_bits <= 4 else ''}] = {{\n{format_2d_array(B_hex)}\n}};\n\n")
 
         f.write(f"// Per-row per-32-K-group scales in {scale_spec}\n")
         f.write(f"static const {c_type_for_bits(As_bits)} A_scales_row[MATMUL_M][MATMUL_GK] = {{\n{format_2d_array(As_hex)}\n}};\n\n")
@@ -678,6 +720,7 @@ def run_experiment(
     print_inputs_fp32: bool = False,
     print_inputs_quant: bool = True,
     print_hex_inputs: bool = True,
+    lut_index_bits: int = -1,
 ):
     """
     Tiled-only golden model:
@@ -712,6 +755,13 @@ def run_experiment(
     A = torch.randn(M, K, device=dev, dtype=torch.float32)
     B = torch.randn(K, N, device=dev, dtype=torch.float32)
 
+    use_lut = lut_index_bits >= 0
+    if use_lut:
+        A_lut = make_lut(input_spec, lut_index_bits, dev)
+        B_lut = make_lut(input_spec, lut_index_bits, dev)
+        A_indices = quantize_lut_indices(A_lut, A)
+        B_indices = quantize_lut_indices(B_lut, B)
+
     print("=== Configuration (TILED MODE) ===")
     print(f"M={M}, K={K}, N={N}, tile={tile}, group={group}")
     print(f"input_spec={input_spec}, input_rounding={input_rounding}")
@@ -720,6 +770,7 @@ def run_experiment(
     print(f"scale_spec={scale_spec}, scale_exp(global_mult)={scale_exp}")
     print(f"header_path={header_path}")
     print(f"device={dev}, seed={seed}")
+    print(f"lut_index_bits={lut_index_bits}")
     print()
 
     if print_inputs_fp32:
@@ -752,8 +803,12 @@ def run_experiment(
         acc_q = make_fp_quantizer(acc_spec, rounding=acc_rounding)
 
     # Quantize inputs to storage/compute format
-    A_in = in_q(A) if in_q is not None else A
-    B_in = in_q(B) if in_q is not None else B
+    if use_lut:
+        A_in = lut_lookup(A_lut, A_indices)
+        B_in = lut_lookup(B_lut, B_indices)
+    else:
+        A_in = in_q(A) if in_q is not None else A
+        B_in = in_q(B) if in_q is not None else B
 
     if print_inputs_quant:
         print("=== Inputs quantized to input precision ===")
@@ -889,8 +944,9 @@ def run_experiment(
             input_spec=input_spec,
             acc_spec=acc_spec,
             scale_spec=scale_spec,
-            A_in=A_in,
-            B_in=B_in,
+            lut_index_bits=lut_index_bits,
+            A_in=A_indices if use_lut else A_in,
+            B_in=B_indices if use_lut else B_in,
             A_scales_row_q=A_scales_row_q,
             B_scales_col_q=B_scales_col_q,
             C_out_bf16=C_out_bf16,
@@ -1025,6 +1081,20 @@ if __name__ == "__main__":
         help="If set, truncate product mantissa to this many fraction bits (RTZ)."
     )
 
+    parser.add_argument(
+        "--lut-index-bits",
+        type=int,
+        default=-1,
+        help="If set and not equal to -1, use inputs quantized to n-bit integers and generate lookup tables to convert to floating point."
+    )
+
+    parser.add_argument(
+        "--tile",
+        type=int,
+        default=16,
+        help="Matrix multiplication tile size."
+    )
+
     args = parser.parse_args()
 
     run_experiment(
@@ -1043,4 +1113,6 @@ if __name__ == "__main__":
         header_path=args.header_path,
         seed=args.seed,
         device=args.device,
+        tile=args.tile,
+        lut_index_bits=args.lut_index_bits,
     )
