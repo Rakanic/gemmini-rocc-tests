@@ -373,10 +373,11 @@ def matmul_outer_quantized_hwlike(
     return C
 
 def compute_tile_scale_matrix_fpe8m0(
-    A_scales_row: Tensor,     # shape [M, Gk]  (per-row, per-32 K-group)
-    B_scales_col: Tensor,     # shape [Gk, N]  (per-col, per-32 K-group)
+    A_scales_row: Tensor,     # shape [M * (K // 32), Gk]  (per-row, per-32 K-group)
+    B_scales_col: Tensor,     # shape [Gk, N * (K // 32)]  (per-col, per-32 K-group)
     m0: int, n0: int, k0: int,
     TM: int, TN: int,
+    M: int, N: int, K: int,
     group: int,
     scale_spec: str = "fpe8m0",
 ) -> Tensor:
@@ -453,6 +454,7 @@ def tiled_matmul_scaled_accum_hwlike(
 
     for m0 in range(0, M, TM):
         for n0 in range(0, N, TN):
+            C_out_tile = torch.zeros((TM, TN), dtype=torch.float32, device=A_in.device)
             for k0 in range(0, K, TK):
                 A_tile = A_in[m0:m0+TM, k0:k0+TK]  # [16,16]
                 B_tile = B_in[k0:k0+TK, n0:n0+TN]  # [16,16]
@@ -469,6 +471,7 @@ def tiled_matmul_scaled_accum_hwlike(
                     A_scales_row, B_scales_col,
                     m0=m0, n0=n0, k0=k0,
                     TM=TM, TN=TN,
+                    M=M, N=N, K=K,
                     group=group,
                     scale_spec=scale_spec
                 )
@@ -477,8 +480,8 @@ def tiled_matmul_scaled_accum_hwlike(
                 C_tile_scaled = q_bf16_rne(C_tile * S_tile_q)
 
                 # 4) accumulate into output in bf16 each tile-add
-                C_prev = C_out
-                C_out = bf16_accum_add(C_out, C_tile_scaled)
+                C_prev = C_out_tile
+                C_out_tile = bf16_accum_add(C_out_tile, C_tile_scaled)
 
                 # optional tracing
                 if should_trace(m0,n0,k0):
@@ -508,8 +511,32 @@ def tiled_matmul_scaled_accum_hwlike(
                         "C_tile_scaled": C_tile_scaled.detach().cpu(),
                         "C_out": C_out.detach().cpu(),
                     })
+            C_out[m0:m0+TM, n0:n0+TN] = C_out_tile
 
     return C_out, debug
+
+
+def array_mx_requantize(array: Tensor, scale_spec: str, quant_spec: str) -> Tuple[Tensor, float]:
+    e_bits, m_bits = parse_fp_spec(quant_spec)
+    max_val = array.abs().to(torch.bfloat16).view(torch.int16).max()
+    max_exp = max_val.log2().floor() # We'll ignore the edge case where all elements are zero, it probably won't happen. Change the seed if it does
+    exp = max_exp - (e_bits + m_bits + 1)
+    scale_factor = make_fp_quantizer(scale_spec)(torch.pow(2.0, exp)).item()
+    return array / scale_factor, scale_factor
+
+
+def matrix_mx_requantize(matrix: Tensor, scale_spec: str, quant_spec: str, group_size: int, Gk: int) -> Tuple[Tensor, Tensor]:
+    device = matrix.device
+    M, N = matrix.shape
+    matrix_scale_groups = matrix.view(M * N // group_size, group_size).detach().cpu()
+    q_groups = []
+    q_scales = []
+    for row in matrix_scale_groups:
+        group, scale = array_mx_requantize(row, scale_spec, quant_spec)
+        q_groups.append(group)
+        q_scales.append(scale)
+    return torch.stack(q_groups).to(device=device).view(M, N), torch.tensor(q_scales, dtype=torch.float32, device=device).view(len(q_scales) // Gk, Gk)
+
 
 def matmul_loss(C_ref: Tensor, C_quant: Tensor) -> Dict[str, float]:
     diff = (C_quant - C_ref).detach()
@@ -620,6 +647,7 @@ def write_c_header(
 def write_c_header_tiled(
     path: str,
     M: int, K: int, N: int,
+    group: int,
     input_spec: str,
     acc_spec: str,
     scale_spec: str,
@@ -629,10 +657,11 @@ def write_c_header_tiled(
     A_scales_row_q: Tensor,   # [M, Gk]
     B_scales_col_q: Tensor,   # [Gk, N]
     C_out_bf16: Tensor,       # [M, N] (bf16 grid stored as fp32)
+    C_out_quantized: Tensor,
+    C_out_scales: Tensor,
     A_lut: Tensor | None = None,
     B_lut: Tensor | None = None,
 ):
-    print(A_lut)
     # encode A/B in input_spec, scales in scale_spec, output in bf16
     if lut_index_bits >= 0:
         A_codes = A_in.tolist()
@@ -647,12 +676,15 @@ def write_c_header_tiled(
         A_codes, A_bits = tensor_to_custom_fp_codes(A_in, input_spec)
         B_codes, B_bits = tensor_to_custom_fp_codes(B_in, input_spec)
         
-    As_codes, As_bits = tensor_to_custom_fp_codes(A_scales_row_q, scale_spec)
+    As_codes, As_bits = tensor_to_custom_fp_codes(A_scales_row_q.transpose(0, 1), scale_spec)
     Bs_codes, Bs_bits = tensor_to_custom_fp_codes(B_scales_col_q, scale_spec)
     C_codes, C_bits = tensor_to_custom_fp_codes(C_out_bf16, "bf16")
+    Cq_codes, Cq_bits = tensor_to_custom_fp_codes(C_out_quantized, input_spec)
+    Cqs_codes, Cqs_bits = tensor_to_custom_fp_codes(C_out_scales.transpose(0, 1), scale_spec)
     # Scale factors are unsigned
     As_bits -= 1
     Bs_bits -= 1
+    Cqs_bits -= 1
 
     guard = path.upper()
     for ch in [".", "/", "\\", "-"]:
@@ -662,12 +694,16 @@ def write_c_header_tiled(
         A_codes = [[((r[i + 1] << 4) | r[i]) for i in range(0, len(r), 2)] for r in A_codes]
     if B_bits <= 4:
         B_codes = [[((r[i + 1] << 4) | r[i]) for i in range(0, len(r), 2)] for r in B_codes]
+    if Cq_bits <= 4:
+        Cq_codes = [[((r[i + 1] << 4) | r[i]) for i in range(0, len(r), 2)] for r in Cq_codes]
     
     A_hex = codes_to_hex_rows(A_codes, A_bits)
     B_hex = codes_to_hex_rows(B_codes, B_bits)
     As_hex = codes_to_hex_rows(As_codes, As_bits)
     Bs_hex = codes_to_hex_rows(Bs_codes, Bs_bits)
     C_hex  = codes_to_hex_rows(C_codes, C_bits)
+    Cq_hex  = codes_to_hex_rows(Cq_codes, Cq_bits)
+    Cqs_hex  = codes_to_hex_rows(Cqs_codes, Cqs_bits)
 
     def format_2d_array(hex_rows: List[List[str]]) -> str:
         lines = []
@@ -680,7 +716,8 @@ def write_c_header_tiled(
         f.write(f"#ifndef {guard}\n#define {guard}\n\n")
         f.write("#include <stdint.h>\n\n")
         f.write(f"#define MATMUL_M {M}\n#define MATMUL_K {K}\n#define MATMUL_N {N}\n")
-        f.write(f"#define MATMUL_GK {(K + 32 - 1)//32}\n\n")
+        f.write(f"#define MATMUL_GK {K // group}\n")
+        f.write(f"#define MATMUL_GN {N // group}\n\n")
 
         f.write(f"// Input precision: {input_spec}")
         if lut_index_bits >= 0:
@@ -692,16 +729,22 @@ def write_c_header_tiled(
         if lut_index_bits >= 0:
             f.write("// Lookup tables\n")
             f.write(f"static const {c_type_for_bits(A_lut_bits)} A_lut[{1 << lut_index_bits}] = {{\n    {(', '.join([f'0x{e[0]}' for e in A_lut_hex]))}\n}};\n\n")
-            # f.write(f"static const {c_type_for_bits(B_lut_bits)} B_lut[{1 << lut_index_bits}] = {{\n{format_2d_array(B_lut_hex)}\n}};\n\n")
+            f.write(f"static const {c_type_for_bits(B_lut_bits)} B_lut[{1 << lut_index_bits}] = {{\n    {(', '.join([f'0x{e[0]}' for e in B_lut_hex]))}\n}};\n\n")
 
         f.write(f"// Per-row per-32-K-group scales in {scale_spec}\n")
-        f.write(f"static const {c_type_for_bits(As_bits)} A_scales_row[MATMUL_M][MATMUL_GK] = {{\n{format_2d_array(As_hex)}\n}};\n\n")
+        f.write(f"static const {c_type_for_bits(As_bits)} A_scales_row[MATMUL_GK][MATMUL_M] = {{\n{format_2d_array(As_hex)}\n}};\n\n")
 
         f.write(f"// Per-col per-32-K-group scales in {scale_spec}\n")
         f.write(f"static const {c_type_for_bits(Bs_bits)} B_scales_col[MATMUL_GK][MATMUL_N] = {{\n{format_2d_array(Bs_hex)}\n}};\n\n")
 
+        f.write(f"// Final output requantized to {input_spec}\n")
+        f.write(f"static const {c_type_for_bits(Cq_bits)} C_out[MATMUL_M][MATMUL_N{' / 2' if Cq_bits <= 4 else ''}] = {{\n{format_2d_array(Cq_hex)}\n}};\n\n")
+
+        f.write(f"// Per-row per-32-K-group output scales in {scale_spec}\n")
+        f.write(f"static const {c_type_for_bits(Cqs_bits)} C_scales_row[MATMUL_GN][MATMUL_M] = {{\n{format_2d_array(Cqs_hex)}\n}};\n\n")
+
         f.write("// Final output (already scaled+accumulated), bf16\n")
-        f.write(f"static const uint16_t C_out[MATMUL_M][MATMUL_N] = {{\n{format_2d_array(C_hex)}\n}};\n\n")
+        f.write(f"static const uint16_t C_out_bf16[MATMUL_M][MATMUL_N] = {{\n{format_2d_array(C_hex)}\n}};\n\n")
         f.write(f"#endif // {guard}\n")
 
 # ----------------------------------------------------------------------
@@ -922,6 +965,13 @@ def run_experiment(
         trace_tiles=trace_tiles,
         trace_max=trace_max,
     )
+    C_out_quantized, C_out_scales = matrix_mx_requantize(
+        C_out_bf16,
+        scale_spec=scale_spec,
+        quant_spec=input_spec,
+        group_size=group,
+        Gk=Gk,
+    )
     t5 = time.perf_counter()
 
     print("=== Output: TILED quantized, scaled per-tile, accumulated in bf16 ===")
@@ -953,6 +1003,7 @@ def run_experiment(
         write_c_header_tiled(
             path=header_path,
             M=M, K=K, N=N,
+            group=group,
             input_spec=input_spec,
             acc_spec=acc_spec,
             scale_spec=scale_spec,
@@ -962,6 +1013,8 @@ def run_experiment(
             A_scales_row_q=A_scales_row_q,
             B_scales_col_q=B_scales_col_q,
             C_out_bf16=C_out_bf16,
+            C_out_quantized=C_out_quantized,
+            C_out_scales=C_out_scales,
             A_lut=A_lut if use_lut else None,
             B_lut=B_lut if use_lut else None,
         )
