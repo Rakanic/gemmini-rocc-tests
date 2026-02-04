@@ -65,17 +65,6 @@ void load_lut(uint8_t *lut, int n) {
   // TODO
 }
 
-int matmul_single_tile(int m, int n) {
-
-  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) A_scales_row, sizeof(A_scales_row));
-  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) B_scales_col, sizeof(B_scales_col));
-  
-
-  
-
-  gemmini_fence();
-}
-
 int main() {
 #ifndef BAREMETAL
   if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
@@ -106,16 +95,22 @@ int main() {
 #endif
 
       for (size_t k = 0; k < MATMUL_K; k += 16) {
+        if (k % 32 == 0) {
+          load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row[k / 32][m], 16); // Can scale factors be indexed by the compute function? If so then these can go before the loop
+          load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col[k / 32][n], 16);
+        }
         gemmini_config_ld(DIM * sizeof(welem_t));
         gemmini_preload(GEMMINI_SPAD_ADDR_B + DIM * sizeof(welem_t) * MATMUL_N * k, GEMMINI_ACC_ADDR_C + DIM * (m + MATMUL_M * n)); // TODO: Check this math. The second argument is the position of the tile in the accumulator. I have low confidence in my math here. DIM should be the size of the tile, may need to be multiplied by sizeof(bf16)
         gemmini_config_ld(DIM * sizeof(elem_t));
         gemmini_compute_preloaded(GEMMINI_SPAD_ADDR_A + DIM * sizeof(elem_t) * MATMUL_M * k, k == 0 ? GARBAGE_ADDR : GEMMINI_ACC_ADDR_C);
       }
-      // MVOUT
     }
   }
-
+  
+  // MVOUT
   gemmini_extended_mvout((void *) C_hw, GEMMINI_ACC_ADDR_C, MATMUL_M, MATMUL_N);
+
+  gemmini_fence();
 
   int errors = 0;
   for (int m = 0; m < MATMUL_M; m ++) {
