@@ -412,6 +412,7 @@ def tiled_matmul_scaled_accum_hwlike(
     B_scales_col: Tensor,     # [Gk, N]
     tile: int = 16,
     group: int = 32,
+    log_file: str = "/dev/null",
     scale_spec: str = "fpe8m0",
     trace_tiles: Optional[List[Tuple[int,int,int]]] = None,  # list of (m0,n0,k0)
     trace_max: int = 8,
@@ -428,6 +429,13 @@ def tiled_matmul_scaled_accum_hwlike(
       C_out (bf16 grid in fp32 tensor),
       debug dict containing optional per-tile dumps.
     """
+    log = open(log_file, "w")
+    def format_2d_array(hex_rows: List[List[str]]) -> str:
+        lines = []
+        for row in hex_rows:
+            line = ", ".join(f"0x{h}" for h in row)
+            lines.append("    { " + line + " }")
+        return ",\n".join(lines)
     M, K = A_in.shape
     K2, N = B_in.shape
     assert K == K2
@@ -454,8 +462,10 @@ def tiled_matmul_scaled_accum_hwlike(
 
     for m0 in range(0, M, TM):
         for n0 in range(0, N, TN):
+            log.write(f"\n\n\n\n== M: {m0}, N: {n0} ==\n\n")
             C_out_tile = torch.zeros((TM, TN), dtype=torch.float32, device=A_in.device)
             for k0 in range(0, K, TK):
+                log.write(f"\n\n= K: {k0} =\n\n")
                 A_tile = A_in[m0:m0+TM, k0:k0+TK]  # [16,16]
                 B_tile = B_in[k0:k0+TK, n0:n0+TN]  # [16,16]
 
@@ -465,6 +475,11 @@ def tiled_matmul_scaled_accum_hwlike(
                     prod_quant=prod_quant,
                     acc_each_add=True
                 )  # returns fp32 tensor on bf16 grid
+
+                log.write("Pre-scaled:\n")
+                C_codes, C_bits = tensor_to_custom_fp_codes(C_tile, "bf16")
+                C_hex  = codes_to_hex_rows(C_codes, C_bits)
+                log.write(format_2d_array(C_hex))
 
                 # 2) scale tile (outer product scales, quantized to scale_spec)
                 S_tile_q = compute_tile_scale_matrix_fpe8m0(
@@ -479,9 +494,19 @@ def tiled_matmul_scaled_accum_hwlike(
                 # 3) scale down and keep bf16
                 C_tile_scaled = q_bf16_rne(C_tile * S_tile_q)
 
+                log.write("\nScaled:\n")
+                C_codes, C_bits = tensor_to_custom_fp_codes(C_tile_scaled, "bf16")
+                C_hex  = codes_to_hex_rows(C_codes, C_bits)
+                log.write(format_2d_array(C_hex))
+
                 # 4) accumulate into output in bf16 each tile-add
                 C_prev = C_out_tile
                 C_out_tile = bf16_accum_add(C_out_tile, C_tile_scaled)
+
+                log.write("\nAccumulated:\n")
+                C_codes, C_bits = tensor_to_custom_fp_codes(C_out_tile, "bf16")
+                C_hex  = codes_to_hex_rows(C_codes, C_bits)
+                log.write(format_2d_array(C_hex))
 
                 # optional tracing
                 if should_trace(m0,n0,k0):
@@ -787,6 +812,7 @@ def run_experiment(
     print_inputs_quant: bool = True,
     print_hex_inputs: bool = True,
     lut_index_bits: int = -1,
+    log_file: str = "/dev/null",
 ):
     """
     Tiled-only golden model:
@@ -973,6 +999,7 @@ def run_experiment(
         B_scales_col=B_scales_col_q,
         tile=tile,
         group=group,
+        log_file=log_file,
         scale_spec=scale_spec,
         trace_tiles=trace_tiles,
         trace_max=trace_max,
@@ -1180,6 +1207,13 @@ if __name__ == "__main__":
         help="Matrix multiplication tile size."
     )
 
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        default="/dev/null",
+        help="Log of intermediate tile values."
+    )
+
     args = parser.parse_args()
 
     run_experiment(
@@ -1200,4 +1234,5 @@ if __name__ == "__main__":
         device=args.device,
         tile=args.tile,
         lut_index_bits=args.lut_index_bits,
+        log_file=args.log_file,
     )
