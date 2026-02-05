@@ -538,6 +538,11 @@ def matrix_mx_requantize(matrix: Tensor, scale_spec: str, quant_spec: str, group
     return torch.stack(q_groups).to(device=device).view(M, N), torch.tensor(q_scales, dtype=torch.float32, device=device).view(len(q_scales) // Gk, Gk)
 
 
+def reverse_lut_quantize(matrix: Tensor, lut: Tensor) -> Tensor:
+    diff = (matrix.unsqueeze(-1) - lut).abs()
+    return diff.argmin(dim=-1)
+
+
 def matmul_loss(C_ref: Tensor, C_quant: Tensor) -> Dict[str, float]:
     diff = (C_quant - C_ref).detach()
     mse = float(torch.mean(diff.pow(2)).item())
@@ -661,25 +666,30 @@ def write_c_header_tiled(
     C_out_scales: Tensor,
     A_lut: Tensor | None = None,
     B_lut: Tensor | None = None,
+    C_lut: Tensor | None = None,
 ):
     # encode A/B in input_spec, scales in scale_spec, output in bf16
     if lut_index_bits >= 0:
         A_codes = A_in.tolist()
         B_codes = B_in.tolist()
+        Cq_codes = C_out_quantized.tolist()
         A_bits = lut_index_bits
         B_bits = lut_index_bits
+        Cq_bits = lut_index_bits
         A_lut_codes, A_lut_bits = tensor_to_custom_fp_codes(A_lut.unsqueeze(-1), input_spec)
         B_lut_codes, B_lut_bits = tensor_to_custom_fp_codes(B_lut.unsqueeze(-1), input_spec)
+        C_lut_codes, C_lut_bits = tensor_to_custom_fp_codes(C_lut.unsqueeze(-1), input_spec)
         A_lut_hex = codes_to_hex_rows(A_lut_codes, A_lut_bits)
         B_lut_hex = codes_to_hex_rows(B_lut_codes, B_lut_bits)
+        C_lut_hex = codes_to_hex_rows(C_lut_codes, C_lut_bits)
     else:
         A_codes, A_bits = tensor_to_custom_fp_codes(A_in, input_spec)
         B_codes, B_bits = tensor_to_custom_fp_codes(B_in, input_spec)
+        Cq_codes, Cq_bits = tensor_to_custom_fp_codes(C_out_quantized, input_spec)
         
     As_codes, As_bits = tensor_to_custom_fp_codes(A_scales_row_q.transpose(0, 1), scale_spec)
     Bs_codes, Bs_bits = tensor_to_custom_fp_codes(B_scales_col_q, scale_spec)
     C_codes, C_bits = tensor_to_custom_fp_codes(C_out_bf16, "bf16")
-    Cq_codes, Cq_bits = tensor_to_custom_fp_codes(C_out_quantized, input_spec)
     Cqs_codes, Cqs_bits = tensor_to_custom_fp_codes(C_out_scales.transpose(0, 1), scale_spec)
     # Scale factors are unsigned
     As_bits -= 1
@@ -730,6 +740,7 @@ def write_c_header_tiled(
             f.write("// Lookup tables\n")
             f.write(f"static const {c_type_for_bits(A_lut_bits)} A_lut[{1 << lut_index_bits}] = {{\n    {(', '.join([f'0x{e[0]}' for e in A_lut_hex]))}\n}};\n\n")
             f.write(f"static const {c_type_for_bits(B_lut_bits)} B_lut[{1 << lut_index_bits}] = {{\n    {(', '.join([f'0x{e[0]}' for e in B_lut_hex]))}\n}};\n\n")
+            f.write(f"static const {c_type_for_bits(C_lut_bits)} C_lut[{1 << lut_index_bits}] = {{\n    {(', '.join([f'0x{e[0]}' for e in C_lut_hex]))}\n}};\n\n")
 
         f.write(f"// Per-row per-32-K-group scales in {scale_spec}\n")
         f.write(f"static const {c_type_for_bits(As_bits)} A_scales_row[MATMUL_GK][MATMUL_M] = {{\n{format_2d_array(As_hex)}\n}};\n\n")
@@ -814,6 +825,7 @@ def run_experiment(
     if use_lut:
         A_lut = make_lut(input_spec, lut_index_bits, dev)
         B_lut = make_lut(input_spec, lut_index_bits, dev)
+        C_lut = make_lut(input_spec, lut_index_bits, dev)
         A_indices = quantize_lut_indices(A_lut, A)
         B_indices = quantize_lut_indices(B_lut, B)
 
@@ -972,6 +984,11 @@ def run_experiment(
         group_size=group,
         Gk=Gk,
     )
+    if use_lut:
+        C_out_quantized = reverse_lut_quantize(
+            C_out_quantized,
+            lut=C_lut
+        )
     t5 = time.perf_counter()
 
     print("=== Output: TILED quantized, scaled per-tile, accumulated in bf16 ===")
@@ -1017,6 +1034,7 @@ def run_experiment(
             C_out_scales=C_out_scales,
             A_lut=A_lut if use_lut else None,
             B_lut=B_lut if use_lut else None,
+            C_lut=C_lut if use_lut else None,
         )
         print(f"Header written to: {header_path}")
     except Exception as e:
