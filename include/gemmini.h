@@ -60,6 +60,7 @@
 #define k_MVOUT_SPAD 23
 #define k_LOOP_WS_CONFIG_SPAD_AB 24
 #define k_LOOP_WS_CONFIG_SPAD_C 25
+#define CONFIG_SCALE_MEM 26
 
 #define CONFIG_EX 0
 #define CONFIG_LD 1
@@ -206,6 +207,10 @@ static acc_scale_t_bits acc_scale_t_to_acc_scale_t_bits(acc_scale_t x) {
   ROCC_INSTRUCTION_0_R_R(x, rs1, rs2, funct)
 
 // mvin and mvout
+
+#define gemmini_config_scale_mem_mvout(dram_addr) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, dram_addr, 0, CONFIG_SCALE_MEM)
+
 #define gemmini_extended_mvin(dram_addr, spad_addr, cols, rows) \
   ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, dram_addr, ((uint64_t)(rows) << (ADDR_LEN + 16)) | ((uint64_t)(cols) << ADDR_LEN) | (spad_addr), k_MVIN)
 
@@ -257,11 +262,28 @@ static acc_scale_t_bits acc_scale_t_to_acc_scale_t_bits(acc_scale_t x) {
   gemmini_preload(GARBAGE_ADDR, C)
 
 // config
-#define gemmini_extended3_config_ex(dataflow, sys_act, sys_shift, sys_acc_scale, C_stride, A_stride, A_transpose, B_transpose, set_only_strides) \
-    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)acc_scale_t_to_acc_scale_t_bits((acc_scale_t)sys_acc_scale) << 32) | ((uint64_t)(A_stride) << 16) | (B_transpose << 9) | (A_transpose << 8) | ((set_only_strides) << 7) | ((sys_act) << 3) | ((dataflow) << 2) | CONFIG_EX, ((uint64_t)(C_stride) << 48) | (sys_shift), k_CONFIG); \
+// RS1: [63:32] acc_scale | [31:16] a_stride | [15:14] out_mx_fmt | [13:12] wgt_mx_fmt | [11:10] act_mx_fmt | [9] b_transpose | [8] a_transpose | [7] set_only_strides | [6] spacer | [5] uselut | [4:3] activation | [2] dataflow | [1:0] cmd_type
+// RS2: [63:48] c_stride | [47:32] relu6_shift | [31:0] in_shift
+#define gemmini_extended3_config_ex(dataflow, sys_act, sys_shift, sys_acc_scale, C_stride, A_stride, A_transpose, B_transpose, set_only_strides, act_mx_fmt, wgt_mx_fmt, out_mx_fmt, uselut) \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, \
+        ((uint64_t)acc_scale_t_to_acc_scale_t_bits((acc_scale_t)sys_acc_scale) << 32) | \
+        ((uint64_t)(A_stride) << 16) | \
+        ((uint64_t)(out_mx_fmt) << 14) | \
+        ((uint64_t)(wgt_mx_fmt) << 12) | \
+        ((uint64_t)(act_mx_fmt) << 10) | \
+        ((uint64_t)(B_transpose) << 9) | \
+        ((uint64_t)(A_transpose) << 8) | \
+        ((uint64_t)(set_only_strides) << 7) | \
+        ((uint64_t)(uselut) << 5) | \
+        ((uint64_t)(sys_act) << 3) | \
+        ((uint64_t)(dataflow) << 2) | \
+        CONFIG_EX, \
+        ((uint64_t)(C_stride) << 48) | (uint64_t)(uint32_t)(sys_shift), \
+        k_CONFIG)
+
 
 #define gemmini_extended2_config_ex(dataflow, sys_act, sys_shift, A_stride, A_transpose, B_transpose) \
-  gemmini_extended3_config_ex(dataflow, sys_act, sys_shift, ACC_SCALE_IDENTITY, 1, A_stride, A_transpose, B_transpose, false)
+  gemmini_extended3_config_ex(dataflow, sys_act, sys_shift, ACC_SCALE_IDENTITY, 1, A_stride, A_transpose, B_transpose, false, 0, 0, 0, 0)
 
 #define gemmini_extended_config_ex(dataflow, sys_act, sys_shift, A_stride, A_transpose, B_transpose) \
   gemmini_extended2_config_ex(dataflow, sys_act, sys_shift, A_stride, A_transpose, B_transpose)
@@ -1636,7 +1658,7 @@ static void sp_tiled_conv(
     const int ocol_it = trans_input_3120 ? 1 : (DIM << input_dilated);
 
     if (trans_input_3120) {
-      gemmini_extended3_config_ex(0, 0, 0, 0, orows * ocols, irows * icols, 0, 0, true);
+      gemmini_extended3_config_ex(0, 0, 0, 0, orows * ocols, irows * icols, 0, 0, true, 0, 0, 0, 0);
     }
 
     for (int och = 0; och < ochs; och += DIM) {
@@ -2313,7 +2335,7 @@ static void tiled_conv(
         out_stride * sizeof(elem_t);
     gemmini_extended_config_st(st_dram_stride, act, scale);
 
-    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, 0, input_dilation, stride >> downsample, trans_input_3120, trans_weight_0132, false);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, 0, input_dilation, stride >> downsample, trans_input_3120, trans_weight_0132, false, 0, 0, 0, 0);
 
     const int pool_out_row_dim = (out_row_dim + 2 * pool_padding - pool_size) / pool_stride + 1;
     const int pool_out_col_dim = (out_col_dim + 2 * pool_padding - pool_size) / pool_stride + 1;
@@ -2561,7 +2583,7 @@ static void tiled_conv_dw(
     const size_t st_dram_stride = channels * sizeof(elem_t);
     gemmini_extended_config_st(st_dram_stride, act, scale);
 
-    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, 0, 1, stride, false, false, false);
+    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, 0, 1, stride, false, false, false, 0, 0, 0, 0);
 
     const int pool_out_row_dim = (out_row_dim + 2 * pool_padding - pool_size) / pool_stride + 1;
     const int pool_out_col_dim = (out_col_dim + 2 * pool_padding - pool_size) / pool_stride + 1;
