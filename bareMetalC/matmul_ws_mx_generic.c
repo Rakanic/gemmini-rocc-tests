@@ -141,9 +141,14 @@ int main() {
   gemmini_extended_mvin((void *) A_in, GEMMINI_SPAD_ADDR_A, MATMUL_K / VALUES_PER_BYTE, MATMUL_M); // TODO: Half one dimension for fp4/6
 
 #ifdef USE_LUT_DEF
-  load_lut((volatile uint32_t *) GEMMINI_LUT0_ADDR, B_lut);
-  load_lut((volatile uint32_t *) GEMMINI_LUT1_ADDR, A_lut);
-  load_lut((volatile uint32_t *) GEMMINI_LUT2_ADDR, C_lut);
+  for (size_t i = 0; i < 16; i ++) {
+    load_lut(((volatile uint32_t *) GEMMINI_LUT0_ADDR) + 3 * i, B_lut);
+    load_lut(((volatile uint32_t *) GEMMINI_LUT1_ADDR) + 3 * i, A_lut);
+    load_lut(((volatile uint32_t *) GEMMINI_LUT2_ADDR) + 3 * i, C_lut);
+  }
+  for (size_t i = 16; i < 32; i ++) {
+    load_lut(((volatile uint32_t *) GEMMINI_LUT2_ADDR) + 3 * i, C_lut);
+  }
 #endif
 
   for (size_t m = 0; m < MATMUL_M; m += TILE) { // TODO: 32 for fp6/4
