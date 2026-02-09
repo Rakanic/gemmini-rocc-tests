@@ -11,6 +11,10 @@
 #include "include/gemmini_testutils.h"
 #include "include/matmul_data.h" 
 
+#define GEMMINI_SF_MEM 0x40088000
+#define GEMMINI_SF_MEM_A (GEMMINI_SF_MEM + 0x2000)
+#define GEMMINI_SF_MEM_B GEMMINI_SF_MEM
+
 // Match your header types
 #define DIM MATMUL_M
 
@@ -46,6 +50,13 @@ typedef uint64_t  out_t;    // C_scaled: fp8:e4m3 (1 byte per output)
 //   }
 // }
 
+void load_scale_factors(volatile uint64_t *sf_mem, uint8_t *scale_factors, int n) {
+  uint64_t *dword_scale_factors = (uint64_t *) scale_factors;
+  for (size_t i = 0; i < n / 8; i ++) {
+    sf_mem[i] = dword_scale_factors[i];
+  }
+}
+
 int main() {
 #ifndef BAREMETAL
   if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
@@ -68,6 +79,8 @@ int main() {
   // Load per-element scaling factors into the scale SRAM
   // (C_scale is uint8_t[DIM][DIM], packed row-major)
   // load_scale_factors((const uint64_t *) C_scale, sizeof(C_scale));
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, A_scales_row , 32);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, B_scales_col , 32);
 
   // MVIN B as B^T for WS
   gemmini_config_ld(DIM * sizeof(welem_t));
