@@ -208,8 +208,8 @@ static acc_scale_t_bits acc_scale_t_to_acc_scale_t_bits(acc_scale_t x) {
 
 // mvin and mvout
 
-#define gemmini_config_scale_mem_mvout(dram_addr) \
-  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, dram_addr, 0, CONFIG_SCALE_MEM)
+#define gemmini_mxquant_config_mvout(lut_update_gran, dram_addr) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)(lut_update_gran) << (33)) | dram_addr, 0, CONFIG_SCALE_MEM)
 
 #define gemmini_extended_mvin(dram_addr, spad_addr, cols, rows) \
   ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, dram_addr, ((uint64_t)(rows) << (ADDR_LEN + 16)) | ((uint64_t)(cols) << ADDR_LEN) | (spad_addr), k_MVIN)
