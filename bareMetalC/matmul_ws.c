@@ -89,30 +89,30 @@ int main() {
   gemmini_mvin((void *) A_in, 0 * DIM);
 
   uint32_t acc_addr = (1u << (ADDR_LEN - 1));
-  gemmini_preload(1 * DIM, acc_addr);  // Read B from spad addr 1*DIM, results -> acc_addr
+//  gemmini_preload(1 * DIM, acc_addr);  // Read B from spad addr 1*DIM, results -> acc_addr
+//
+//  // Compute: A (from spad 0*DIM) × B (preloaded) -> accumulator (at acc_addr)
+//  gemmini_config_ld(DIM * sizeof(elem_t));
+//  gemmini_compute_preloaded(0 * DIM, GARBAGE_ADDR);
+//
+//  uint32_t mvout_addr = acc_addr & ~(1 << (ADDR_LEN - 2));  // Clear accumulate bit
+//  mvout_addr |= (1 << 29);  // Set full row bit
+////  gemmini_mvout((void *) C_hw, mvout_addr);
+//  gemmini_mvout_spad(0, acc_addr);
 
-  // Compute: A (from spad 0*DIM) × B (preloaded) -> accumulator (at acc_addr)
-  gemmini_config_ld(DIM * sizeof(elem_t));
-  gemmini_compute_preloaded(0 * DIM, GARBAGE_ADDR);
-
-  uint32_t mvout_addr = acc_addr & ~(1 << (ADDR_LEN - 2));  // Clear accumulate bit
-  mvout_addr |= (1 << 29);  // Set full row bit
-//  gemmini_mvout((void *) C_hw, mvout_addr);
-  gemmini_mvout_spad(0, acc_addr);
-
-//    gemmini_loop_ws_spad(
-//        1, 1, 1,              // I=1, J=1, K=1 (single 16×16 tile)
-//        0, 0, 0,              // pad_I=0, pad_J=0, pad_K=0
-//        0 * DIM,              // A scratchpad address
-//        2 * DIM,              // B scratchpad address
-//        0,                    // D (bias) - none
-//        acc_addr,             // C accumulator address
-//        false, false,         // A_transpose, B_transpose
-//        false, false, false,  // full_C, low_D, ex_accumulate
-//        NO_ACTIVATION,        // activation
-//        0, 0,                 // a_spad_id, b_spad_id
-//        false,                // is_resadd
-//        0x38);                // skips
+    gemmini_loop_ws_spad(
+        1, 1, 1,              // I=1, J=1, K=1 (single 16×16 tile)
+        0, 0, 0,              // pad_I=0, pad_J=0, pad_K=0
+        0 * DIM,              // A scratchpad address
+        2 * DIM,              // B scratchpad address
+        0,                    // D (bias) - none
+        acc_addr,             // C accumulator address
+        false, false,         // A_transpose, B_transpose
+        false, false, false,  // full_C, low_D, ex_accumulate
+        NO_ACTIVATION,        // activation
+        0, 0,                 // a_spad_id, b_spad_id
+        false,                // is_resadd
+        0x38);                // skips
 
 
   // Single fence at the end, like your fp6 test
