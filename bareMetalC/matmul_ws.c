@@ -71,7 +71,8 @@ int main() {
 
   // ---------- Run Gemmini (fp8 WS test) ----------
   gemmini_flush(0);
-  gemmini_config_ex(WEIGHT_STATIONARY, 0, 0);
+//  gemmini_config_ex(WEIGHT_STATIONARY, 0, 0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
 
   // We want 1 byte per output element in DRAM
   gemmini_extended_config_st(DIM * sizeof(out_t), NO_ACTIVATION, 1);
@@ -82,22 +83,37 @@ int main() {
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, A_scales_row , 32);
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, B_scales_col , 32);
 
-  // MVIN B as B^T for WS
-  gemmini_config_ld(DIM * sizeof(welem_t));
-  gemmini_mvin((void *) B_in, 1 * DIM);
-
-  // MVIN A
+  // MVIN B and A
   gemmini_config_ld(DIM * sizeof(elem_t));
+  gemmini_mvin((void *) B_in, 1 * DIM);
   gemmini_mvin((void *) A_in, 0 * DIM);
 
-  // Preload + compute
-  gemmini_config_ld(DIM * sizeof(welem_t));
-  gemmini_preload(1 * DIM, (1u << (ADDR_LEN - 1)));
+  uint32_t acc_addr = (1u << (ADDR_LEN - 1));
+  gemmini_preload(1 * DIM, acc_addr);  // Read B from spad addr 1*DIM, results -> acc_addr
+
+  // Compute: A (from spad 0*DIM) × B (preloaded) -> accumulator (at acc_addr)
   gemmini_config_ld(DIM * sizeof(elem_t));
   gemmini_compute_preloaded(0 * DIM, GARBAGE_ADDR);
 
-  // MVOUT scaled fp8 C
-  gemmini_mvout((void *) C_hw, (1u << (ADDR_LEN - 1)));
+  uint32_t mvout_addr = acc_addr & ~(1 << (ADDR_LEN - 2));  // Clear accumulate bit
+  mvout_addr |= (1 << 29);  // Set full row bit
+//  gemmini_mvout((void *) C_hw, mvout_addr);
+  gemmini_mvout_spad(0, acc_addr);
+
+//    gemmini_loop_ws_spad(
+//        1, 1, 1,              // I=1, J=1, K=1 (single 16×16 tile)
+//        0, 0, 0,              // pad_I=0, pad_J=0, pad_K=0
+//        0 * DIM,              // A scratchpad address
+//        2 * DIM,              // B scratchpad address
+//        0,                    // D (bias) - none
+//        acc_addr,             // C accumulator address
+//        false, false,         // A_transpose, B_transpose
+//        false, false, false,  // full_C, low_D, ex_accumulate
+//        NO_ACTIVATION,        // activation
+//        0, 0,                 // a_spad_id, b_spad_id
+//        false,                // is_resadd
+//        0x38);                // skips
+
 
   // Single fence at the end, like your fp6 test
   gemmini_fence();
@@ -107,15 +123,23 @@ int main() {
   for (int i = 0; i < DIM; i++) {
     for (int j = 0; j < DIM; j++) {
       uint64_t got = C_hw[i][j];
-// uint64_t exp = (uint64_t) C_scaled[i][j];
-// if (got != exp) {
-// printf("@(%d,%d) HW=0x%02x  EXP=0x%02x\n",
-// i, j, (unsigned) got, (unsigned) exp);
-// errors++;
-// }
+//      uint64_t exp = (uint64_t) C_scaled[i][j];
+//      if (got != exp) {
+//        printf("@(%d,%d) HW=0x%02x  EXP=0x%02x\n",
+//        i, j, (unsigned) got, (unsigned) exp);
+//        errors++;
+//      }
     }
-  } 
+  }
 
+//  for (int i = 0; i < DIM; i++) {
+//    for (int j = 0; j < DIM; j++) {
+//      uint64_t got = C_hw[i][j];
+//      printf("%x,", got);
+//    }
+//    printf("\n");
+//  }
+//
   if (errors == 0) {
     printf("fp8 WS matmul test PASSED (no mismatches).\n");
   } else {
