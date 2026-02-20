@@ -82,6 +82,8 @@ int main() {
   // load_scale_factors((const uint64_t *) C_scale, sizeof(C_scale));
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, A_scales_row , 32);
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, B_scales_col , 32);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, A_scales_row , 32);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, B_scales_col , 32);
 
   // MVIN B and A
   gemmini_config_ld(DIM * sizeof(elem_t));
@@ -114,6 +116,7 @@ int main() {
         false,                // is_resadd
         0x38);                // skips
 
+//  gemmini_mvout_spad(0, acc_addr);
 
   // Single fence at the end, like your fp6 test
   gemmini_fence();
