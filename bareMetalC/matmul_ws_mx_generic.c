@@ -204,7 +204,7 @@ load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales
   // }
   
   // MVOUT
-//  gemmini_mvout((void *) C_hw, (1u << (ADDR_LEN - 1)));
+  // gemmini_mvout((void *) C_hw, (1u << (ADDR_LEN - 1)));
 
   gemmini_fence();
 
@@ -212,11 +212,11 @@ load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales
   for (int m = 0; m < MATMUL_M / VALUES_PER_BYTE; m ++) {
     for (int n = 0; n < MATMUL_N; n ++) {
       uint64_t got = C_hw[m][n];
-      uint64_t exp = (uint64_t) C_out[m][n];
-//      if (got != exp) {
-//          errors ++;
-//          printf("Got: %d    Expected: %d\n", got, exp);
-//      }
+      // uint64_t exp = (uint64_t) C_out[m][n];
+      // if (got != exp) {
+          // errors ++;
+          // printf("Got: %d    Expected: %d\n", got, exp);
+      // }
     }
   }
 }

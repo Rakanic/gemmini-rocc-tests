@@ -58,6 +58,7 @@ tests = \
 	gemmini_counter \
 	template \
 	matmul_ws_mx_generic \
+	matmul_tiled_fp8 \
 
 tests_baremetal = $(tests:=-baremetal)
 
