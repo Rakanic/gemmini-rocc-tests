@@ -64,7 +64,12 @@ int main() {
     return 1;
   }
 #endif
-
+  static uint32_t scale_factors[16] = {
+      0x3F800000, 0x3F800000, 0x3F800000, 0x3F800000,  // e.g. 1.0f in IEEE754
+      0x40000000, 0x40000000, 0x40000000, 0x40000000,  // e.g. 2.0f
+      0x3F000000, 0x3F000000, 0x3F000000, 0x3F000000,  // e.g. 0.5f
+      0x3FC00000, 0x3FC00000, 0x3FC00000, 0x3FC00000,  // e.g. 1.5f
+  };
   // ---- Buffers ----
   // Inputs come from MATMUL_DATA_H: A_in[16][16], B_in[16][16]
   static out_t C_hw[DIM][DIM] = {0};  // fp8 outputs from HW
@@ -76,15 +81,16 @@ int main() {
 
   // We want 1 byte per output element in DRAM
   gemmini_extended_config_st(DIM * sizeof(out_t), NO_ACTIVATION, 1);
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, 2, 2, 2, 0, 0);
+
 
   // Load per-element scaling factors into the scale SRAM
   // (C_scale is uint8_t[DIM][DIM], packed row-major)
   // load_scale_factors((const uint64_t *) C_scale, sizeof(C_scale));
-  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, A_scales_row , 32);
-  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, A_scales_row , 32);
-  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, B_scales_col , 32);
-  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, B_scales_col , 32);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, 512);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, 512);
 
+ 
   // MVIN B and A
   gemmini_config_ld(MATMUL_M * sizeof(elem_t));
 

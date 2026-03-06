@@ -509,33 +509,33 @@ def tiled_matmul_scaled_accum_hwlike(
                 log.write(format_2d_array(C_hex))
 
                 # optional tracing
-                if should_trace(m0,n0,k0):
-                    traced += 1
-                    print(f"\n=== TILE (m0={m0}, n0={n0}, k0={k0}) g={k0//group} ===")
-                    print("A_tile:")
-                    print(A_tile.detach().cpu().numpy())
-                    print("B_tile:")
-                    print(B_tile.detach().cpu().numpy())
-                    print("C_tile (bf16 grid):")
-                    print(C_tile.detach().cpu().numpy())
-                    print(f"S_tile_q ({scale_spec}):")
-                    print(S_tile_q.detach().cpu().numpy())
-                    print("C_tile_scaled (bf16):")
-                    print(C_tile_scaled.detach().cpu().numpy())
-                    print("C_out before add (bf16 grid):")
-                    print(q_bf16_rne(C_prev).detach().cpu().numpy())
-                    print("C_out after add (bf16 grid):")
-                    print(C_out.detach().cpu().numpy())
+                # if should_trace(m0,n0,k0):
+                #     traced += 1
+                #     print(f"\n=== TILE (m0={m0}, n0={n0}, k0={k0}) g={k0//group} ===")
+                #     print("A_tile:")
+                #     print(A_tile.detach().cpu().numpy())
+                #     print("B_tile:")
+                #     print(B_tile.detach().cpu().numpy())
+                #     print("C_tile (bf16 grid):")
+                #     print(C_tile.detach().cpu().numpy())
+                #     print(f"S_tile_q ({scale_spec}):")
+                #     print(S_tile_q.detach().cpu().numpy())
+                #     print("C_tile_scaled (bf16):")
+                #     print(C_tile_scaled.detach().cpu().numpy())
+                #     print("C_out before add (bf16 grid):")
+                #     print(q_bf16_rne(C_prev).detach().cpu().numpy())
+                #     print("C_out after add (bf16 grid):")
+                #     print(C_out.detach().cpu().numpy())
 
-                    debug["tiles"].append({
-                        "m0": m0, "n0": n0, "k0": k0, "g": k0//group,
-                        "A_tile": A_tile.detach().cpu(),
-                        "B_tile": B_tile.detach().cpu(),
-                        "C_tile": C_tile.detach().cpu(),
-                        "S_tile_q": S_tile_q.detach().cpu(),
-                        "C_tile_scaled": C_tile_scaled.detach().cpu(),
-                        "C_out": C_out.detach().cpu(),
-                    })
+                #     debug["tiles"].append({
+                #         "m0": m0, "n0": n0, "k0": k0, "g": k0//group,
+                #         "A_tile": A_tile.detach().cpu(),
+                #         "B_tile": B_tile.detach().cpu(),
+                #         "C_tile": C_tile.detach().cpu(),
+                #         "S_tile_q": S_tile_q.detach().cpu(),
+                #         "C_tile_scaled": C_tile_scaled.detach().cpu(),
+                #         "C_out": C_out.detach().cpu(),
+                #     })
             C_out[m0:m0+TM, n0:n0+TN] = C_out_tile
 
     return C_out, debug
@@ -903,14 +903,14 @@ def run_experiment(
         A_in = in_q(A) if in_q is not None else A
         B_in = in_q(B) if in_q is not None else B
 
-    if print_inputs_quant:
-        print("=== Inputs quantized to input precision ===")
-        print(f"A_in (float, {input_spec}, rounding={input_rounding}):")
-        print(A_in.detach().cpu().numpy())
-        print()
-        print(f"B_in (float, {input_spec}, rounding={input_rounding}):")
-        print(B_in.detach().cpu().numpy())
-        print()
+    # if print_inputs_quant:
+    #     print("=== Inputs quantized to input precision ===")
+    #     print(f"A_in (float, {input_spec}, rounding={input_rounding}):")
+    #     print(A_in.detach().cpu().numpy())
+    #     print()
+    #     print(f"B_in (float, {input_spec}, rounding={input_rounding}):")
+    #     print(B_in.detach().cpu().numpy())
+    #     print()
 
     # Optional hex dump of input encodings
     A_codes = B_codes = None
@@ -977,16 +977,16 @@ def run_experiment(
     t0 = time.perf_counter()
     C_ref_full = matmul_outer(A, B)
     t1 = time.perf_counter()
-    print("=== Reference: FP32 matmul, FP32 inputs ===")
-    print(f"(time: {t1 - t0:.6f} s)")
-    print()
+    # print("=== Reference: FP32 matmul, FP32 inputs ===")
+    # print(f"(time: {t1 - t0:.6f} s)")
+    # print()
 
     t2 = time.perf_counter()
     C_ref_in = matmul_outer(A_in, B_in)
     t3 = time.perf_counter()
-    print(f"=== Reference: FP32 matmul, input-quantized inputs ({input_spec}) ===")
-    print(f"(time: {t3 - t2:.6f} s)")
-    print()
+    # print(f"=== Reference: FP32 matmul, input-quantized inputs ({input_spec}) ===")
+    # print(f"(time: {t3 - t2:.6f} s)")
+    # print()
 
     # ------------------------------------------------------------------
     # tiled quantized matmul + tile scale + bf16 accumulation
@@ -1030,15 +1030,15 @@ def run_experiment(
     metrics_vs_full = matmul_loss(C_ref_full, C_out_bf16)
     metrics_vs_in   = matmul_loss(C_ref_in,   C_out_bf16)
 
-    print("=== Error metrics: C_out_bf16 vs C_ref_full (FP32 inputs) ===")
-    for k, v in metrics_vs_full.items():
-        print(f"{k}: {v:.6e}")
-    print()
+    # print("=== Error metrics: C_out_bf16 vs C_ref_full (FP32 inputs) ===")
+    # for k, v in metrics_vs_full.items():
+    #     print(f"{k}: {v:.6e}")
+    # print()
 
-    print(f"=== Error metrics: C_out_bf16 vs C_ref_in (input-quantized, ideal MAC) ===")
-    for k, v in metrics_vs_in.items():
-        print(f"{k}: {v:.6e}")
-    print()
+    # print(f"=== Error metrics: C_out_bf16 vs C_ref_in (input-quantized, ideal MAC) ===")
+    # for k, v in metrics_vs_in.items():
+    #     print(f"{k}: {v:.6e}")
+    # print()
 
     # ------------------------------------------------------------------
     # output header (single writer; do NOT call the old write_c_header)
