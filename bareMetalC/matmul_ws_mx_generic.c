@@ -124,11 +124,13 @@ int main() {
     ((uint64_t)(1) << 48) // C stride
     | (0),
     k_CONFIG);
-
+  int tiles_I = MATMUL_M / 32;                       // = 4
+  int tiles_K = MATMUL_K / 16;                         // = 8
+  int tiles_J = MATMUL_N / 32 ;                           // = 4  (each n-tile = DIM*2 original cols)
   gemmini_extended_config_st(DIM * sizeof(out_t), NO_ACTIVATION, 1);
   // gemmini_extended_mvin((void *) B_in, GEMMINI_SPAD_ADDR_B, MATMUL_N / VALUES_PER_BYTE, MATMUL_K); // TODO: Half one dimension for fp4/6
   //gemmini_mxquant_config_mvout(1024, (uint64_t)scale_factors);
-  gemmini_mxquant_config_mvout((uint64_t)scale_factors, 4, 4, 8, 0, 0, QUANT_LUT_UPDATE_GRANULARITY);
+  gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, QUANT_LUT_UPDATE_GRANULARITY);
    // MVIN B
     
 #ifdef USE_LUT_DEF
@@ -144,16 +146,14 @@ int main() {
   }
 #endif
 
-  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, 512);
-  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, 512);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M*MATMUL_GK);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N*MATMUL_GK);
   gemmini_fence(); 
   //gemmini_config_ld(MATMUL_M * sizeof(elem_t));
   // Tile counts
   // A_in_hw[MATMUL_M/2][MATMUL_K]: tiles_I m-tiles x tiles_K k-tiles, each K_TILE hw-rows x DIM bytes
   // B_in[MATMUL_K][MATMUL_N/2]:    tiles_K k-tiles x tiles_J n-tiles, each K_TILE rows x DIM bytes
-  int tiles_I = MATMUL_M / 32;                       // = 4
-  int tiles_K = MATMUL_K / 16;                         // = 8
-  int tiles_J = MATMUL_N / 32 ;                           // = 4  (each n-tile = DIM*2 original cols)
+  
 
   uint32_t a_base = 0;
   uint32_t b_base = 8192 - tiles_K * tiles_J * K_TILE;
@@ -181,7 +181,7 @@ int main() {
   }
 
  uint32_t acc_addr = (1u << (ADDR_LEN - 1));
- gemmini_loop_ws_spad( 4, 4, 8,            
+ gemmini_loop_ws_spad( tiles_I, tiles_J, tiles_K,            
       0, 0, 0,              // pad_I=0, pad_J=0, pad_K=0
       a_base,               // A scratchpad address
       8192,                 // B scratchpad end address
