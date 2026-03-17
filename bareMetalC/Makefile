@@ -62,6 +62,7 @@ tests = \
 	matmul_single_tile_test \
 	matmul_tiled_fp8_64x64 \
 	matmul_tiled_fp8_128x128 \
+	matmul_tiled_fp8_128x128x256 \
 
 tests_baremetal = $(tests:=-baremetal)
 
