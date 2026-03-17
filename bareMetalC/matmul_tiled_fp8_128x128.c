@@ -8,7 +8,7 @@
 #endif
 
 #include "include/gemmini_testutils.h"
-#include "include/matmul_data_mx_fp8.h"
+#include "include/matmul_fp8_128x128.h"
 
 #define GEMMINI_SF_MEM 0x40088000
 #define GEMMINI_SF_MEM_A (GEMMINI_SF_MEM + 0x2000)
@@ -21,6 +21,7 @@
 #define GEMMINI_RS1_ADDR (GEMMINI_CTRL + 0x10)
 #define GEMMINI_RS2_ADDR (GEMMINI_CTRL + 0x18)
 #define GEMMINI_INST_ADDR (GEMMINI_CTRL + 0x0)
+#define GEMMINI_BUSY_ADDR (GEMMINI_CTRL + 0x20)
 
 #undef ROCC_INSTRUCTION_RS1_RS2
 #define ROCC_INSTRUCTION_RS1_RS2(x, rs1, rs2, funct) { \
@@ -46,6 +47,14 @@ void load_scale_factors(volatile uint64_t *sf_mem, uint8_t *scale_factors, int n
   }
 }
 
+// Spin until Gemmini reports not busy
+static inline void gemmini_poll_until_ready() {
+    volatile uint32_t *status = (volatile uint32_t*)(GEMMINI_BUSY_ADDR); // check your offset
+    while (*status & 0x1) {
+        // busy — keep polling
+    }
+}
+
 int main() {
 #ifndef BAREMETAL
   if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
@@ -57,7 +66,6 @@ int main() {
   // ---- Output buffer ----
   static out_t C_hw[MATMUL_M][OUT_COLS];
   uint32_t scale_factors[512] = {0};
-
   memset(C_hw, 0, sizeof(C_hw));
 
   // ---- Tile dimensions ----
@@ -74,8 +82,8 @@ int main() {
   gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
 
   // ---- Load scale factors ----
-  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, 512);
-  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, 512);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, 1024);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, 1024);
 
   // ---- MVIN A: tile (i,k) -> a_base + (i*tiles_K + k)*DIM ----
   gemmini_config_ld(MATMUL_M * sizeof(elem_t));
@@ -102,7 +110,6 @@ int main() {
   gemmini_config_st(OUT_COLS * sizeof(out_t));
   gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
 
-
   // ---- Compute ----
   gemmini_loop_ws_spad(
       tiles_I, tiles_J, tiles_K,
@@ -126,20 +133,22 @@ int main() {
 //    }
 //  }
 
+
+//  gemmini_mvout((void*)&C_hw[0][0], 128 )
+
+  gemmini_fence();
+  gemmini_poll_until_ready();
+  gemmini_fence();
+
   uint64_t* smem_start_addr = ((uint64_t*)SMEM) + SPAD_DEST * 2;
   printf("Address: %p \n", smem_start_addr);
   for (int i = 0; i < MATMUL_M; i ++) {
     for (int j = 0; j < OUT_COLS; j++) {
 //       printf("addr: %p \n", smem_start_addr + (i*8 + j) );
-//       printf("Elem: %d = %lx \n", i * 32 + j, *(smem_start_addr + (i*8 + j)));
-        C_hw[i][j] = *(smem_start_addr + (i*8 + j));
+//       printf("Elem: %d = %lx \n", i * MATMUL_M + j, *(smem_start_addr + (i*OUT_COLS + j)));
+        C_hw[i][j] = *(smem_start_addr + (i*OUT_COLS + j));
     }
   }
-
-
-//  gemmini_mvout((void*)&C_hw[0][0], 128 )
-
-  gemmini_fence();
 
   // ---- Debug print tile (0,0) ----
 //  printf("=== Tile (0,0) - acc_addr=0x%08x ===\n", acc_addr);
