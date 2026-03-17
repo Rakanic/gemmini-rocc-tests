@@ -97,12 +97,7 @@ int main() {
     return 1;
   }
 #endif
-  static uint32_t scale_factors[16] = {
-      0x3F800000, 0x3F800000, 0x3F800000, 0x3F800000,  // e.g. 1.0f in IEEE754
-      0x40000000, 0x40000000, 0x40000000, 0x40000000,  // e.g. 2.0f
-      0x3F000000, 0x3F000000, 0x3F000000, 0x3F000000,  // e.g. 0.5f
-      0x3FC00000, 0x3FC00000, 0x3FC00000, 0x3FC00000,  // e.g. 1.5f
-  };
+  static uint32_t scale_factors[MATMUL_M * MATMUL_N / 32] __attribute__((aligned(8))) = {0};
 
 
   // Configure Gemmini
@@ -142,7 +137,7 @@ int main() {
     load_lut(((volatile uint32_t *) GEMMINI_LUT1_ADDR) + 3 * i, (uint8_t *) A_lut[i]);
   }
   for (size_t i = 0; i < (MATMUL_M >> QUANT_LUT_UPDATE_GRANULARITY); i++) {
-    load_lut(((volatile uint32_t *) GEMMINI_LUT2_ADDR) + 3 * i, (uint8_t *) A_lut[i]);
+    load_lut(((volatile uint32_t *) GEMMINI_LUT2_ADDR) + 3 * i, (uint8_t *) C_lut[i]);
   }
 #endif
 
