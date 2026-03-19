@@ -366,19 +366,63 @@ def array_mx_requantize(array: Tensor, quant_spec: str) -> Tuple[Tensor, float]:
     scale_factor = make_fp_quantizer(SCALE_SPEC, "nearest")(torch.pow(2.0, exp)).item()
     return array / scale_factor, scale_factor
 
-def matrix_mx_requantize(matrix: Tensor) -> Tuple[Tensor, Tensor]:
+def _po2(x: Tensor) -> Tensor:
+    """Round to nearest power of 2 (toward +inf in exponent)."""
+    x = x.to(torch.float32)
+    # For each element, find floor(log2(x)) then return 2^that
+    nz = x > 0
+    out = torch.ones_like(x)
+    if nz.any():
+        log2_x = torch.log2(x[nz])
+        exp = torch.floor(log2_x)
+        out[nz] = torch.pow(2.0, exp)
+        # If the value isn't exactly a power of 2, round up
+        too_small = out[nz] < x[nz]
+        exp[too_small] = exp[too_small] + 1
+        out[nz] = torch.pow(2.0, exp)
+    return out
+
+def matrix_mx_requantize(matrix: Tensor, quant_spec: str = INPUT_SPEC) -> Tuple[Tensor, Tensor]:
+    """
+    Requantize each block of 32 columns independently.
+    Returns:
+        quantized matrix (M, N)
+        scales (M, N//32) — one power-of-2 scale per row per 32-col block
+    """
     M, N = matrix.shape
-    Gk = (N + GROUP - 1) // GROUP
-    matrix_scale_groups = matrix.view(M * N // GROUP, GROUP).detach().cpu()
-    q_groups = []
-    q_scales = []
-    for row in matrix_scale_groups:
-        group, scale = array_mx_requantize(row, INPUT_SPEC)
-        q_groups.append(group)
-        q_scales.append(scale)
-    n_scales = len(q_scales)
-    return (torch.stack(q_groups).view(M, N),
-            torch.tensor(q_scales, dtype=torch.float32).view(n_scales // Gk, Gk))
+    assert N % GROUP == 0
+    nblocks = N // GROUP
+
+    e_bits, m_bits = parse_fp_spec(quant_spec)
+    max_representable = (2.0 ** ((1 << (e_bits - 1)) - 1)) * (2.0 - 2.0 ** (-m_bits))
+
+    q_fn = make_fp_quantizer(quant_spec, rounding="zero")
+    scale_q_fn = make_fp_quantizer(SCALE_SPEC, "nearest")
+
+    C_quantized = torch.zeros_like(matrix)
+    C_scales = torch.zeros(M, nblocks, dtype=torch.float32)
+
+    for bi in range(nblocks):
+        c0 = bi * GROUP
+        c1 = c0 + GROUP
+        block = matrix[:, c0:c1]  # (M, 32)
+
+        # Per-row max absolute value within this 32-col block
+        block_max = block.abs().amax(dim=1, keepdim=True)  # (M, 1)
+
+        # Power-of-2 scale: largest po2 such that block_max / scale <= max_representable
+        # scale = po2(block_max / max_representable)
+        raw_scale = block_max / max_representable
+        scale = _po2(raw_scale)
+        scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+        scale = scale_q_fn(scale)
+
+        # Quantize the block
+        scaled_block = block / scale
+        C_quantized[:, c0:c1] = q_fn(scaled_block)
+        C_scales[:, bi] = scale.squeeze(1)
+
+    return C_quantized, C_scales
 
 # --- Entry point ---
 

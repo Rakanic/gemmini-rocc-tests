@@ -39,6 +39,7 @@
 #define GEMMINI_SF_MEM 0x40088000
 #define GEMMINI_SF_MEM_A (GEMMINI_SF_MEM + 0x2000)
 #define GEMMINI_SF_MEM_B GEMMINI_SF_MEM
+#define SMEM 0x40000000
 
 #define GEMMINI_SPAD_ADDR_A (DIM + MATMUL_N /2 * MATMUL_GK)
 #define GEMMINI_SPAD_ADDR_B 0x0
@@ -97,8 +98,9 @@ int main() {
     return 1;
   }
 #endif
-  static uint32_t scale_factors[MATMUL_M * MATMUL_N / 32] __attribute__((aligned(8))) = {0};
-
+  static uint32_t scale_factors[MATMUL_M * MATMUL_N / 32] __attribute__((aligned(32))) = {0};
+  static uint64_t C_hw[MATMUL_M/2][MATMUL_N/8];
+  memset(C_hw, 0, sizeof(C_hw));
 
   // Configure Gemmini
   gemmini_flush(0);
@@ -127,7 +129,7 @@ int main() {
   //gemmini_mxquant_config_mvout(1024, (uint64_t)scale_factors);
   gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, QUANT_LUT_UPDATE_GRANULARITY);
    // MVIN B
-    
+
 #ifdef USE_LUT_DEF
   // A_lut[M>>G][LUT_SIZE] and B_lut[N>>G][LUT_SIZE]: one unique LUT per slot
   for (size_t i = 0; i < (MATMUL_N >> QUANT_LUT_UPDATE_GRANULARITY); i++) {
@@ -143,16 +145,16 @@ int main() {
 
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M*MATMUL_GK);
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N*MATMUL_GK);
-  gemmini_fence(); 
+  gemmini_fence();
   //gemmini_config_ld(MATMUL_M * sizeof(elem_t));
   // Tile counts
   // A_in_hw[MATMUL_M/2][MATMUL_K]: tiles_I m-tiles x tiles_K k-tiles, each K_TILE hw-rows x DIM bytes
   // B_in[MATMUL_K][MATMUL_N/2]:    tiles_K k-tiles x tiles_J n-tiles, each K_TILE rows x DIM bytes
-  
+
 
   uint32_t a_base = 0;
   uint32_t b_base = 8192 - tiles_K * tiles_J * K_TILE;
-  
+
   // MVIN A: stride = MATMUL_K (full hw-row width); each tile = K_TILE hw-rows x DIM bytes
   gemmini_config_ld((MATMUL_K) * sizeof(uint8_t));
   for (int i = 0; i < tiles_I; i++) {
@@ -175,13 +177,15 @@ int main() {
     }
   }
 
+  int SPAD_DEST = 128;
+
  uint32_t acc_addr = (1u << (ADDR_LEN - 1));
- gemmini_loop_ws_spad( tiles_I, tiles_J, tiles_K,            
+ gemmini_loop_ws_spad( tiles_I, tiles_J, tiles_K,
       0, 0, 0,              // pad_I=0, pad_J=0, pad_K=0
       a_base,               // A scratchpad address
       8192,                 // B scratchpad end address
       0,                    // D (bias) - none
-      acc_addr,   // C accumulator address
+      SPAD_DEST,   // C accumulator address
       false, false,         // A_transpose, B_transpose
       false, false, false,  // full_C, low_D, ex_accumulate
       NO_ACTIVATION,        // activation
@@ -189,7 +193,7 @@ int main() {
       false,                // is_resadd
       0x38);       //now skip the, ldA, ldB, and st
 
-// ┌─────┬──────┬────────────────────────────────┐
+//   ┌─────┬──────┬────────────────────────────────┐
 //   │ Bit │ Mask │             Skips              │
 //   ├─────┼──────┼────────────────────────────────┤
 //   │ 3   │ 0x08 │ ldA (skip loading A from DRAM) │
@@ -214,21 +218,44 @@ int main() {
   //     }
   //   }
   // }
-  
+
   // MVOUT
   // gemmini_mvout((void *) C_hw, (1u << (ADDR_LEN - 1)));
   //gemmini_mvout_spad(dst_addr, (1u << (ADDR_LEN - 1)))
   gemmini_fence();
 
-  // int errors = 0;
-  // for (int m = 0; m < MATMUL_M / VALUES_PER_BYTE; m ++) {
-  //   for (int n = 0; n < MATMUL_N; n ++) {
-  //     uint64_t got = C_hw[m][n];
-  //     // uint64_t exp = (uint64_t) C_out[m][n];
-  //     // if (got != exp) {
-  //         // errors ++;
-  //         // printf("Got: %d    Expected: %d\n", got, exp);
-  //     // }
-  //   }
-  // }
+
+  uint64_t* smem_start_addr = ((uint64_t*)SMEM) + SPAD_DEST * 2;
+  printf("Address: %p \n", smem_start_addr);
+  for (int i = 0; i < MATMUL_M/2; i++) {
+      for (int j = 0; j < MATMUL_N/8; j++) {
+        C_hw[i][j] = *(smem_start_addr + i * MATMUL_N + j);
+//        printf("C_hw[%d][%d]: %lx \n", i, j, C_hw[i][j]);
+     }
+  }
+
+  int errors = 0;
+  for (int i = 0; i < MATMUL_M/2; i++) {
+      for (int j = 0; j < MATMUL_N/8; j++) {
+          uint64_t got = C_hw[i][j];
+          uint64_t exp = 0;
+          for (int b = 0; b < 8; b++) {
+              exp |= ((uint64_t)C_proj_hw[i][j * 8 + b]) << (b * 8);
+          }
+          if (got != exp) {
+              for (int b = 0; b < 8; b++) {
+                  uint8_t got_byte = (got >> (b * 8)) & 0xFF;
+                  uint8_t exp_byte = C_proj_hw[i][j * 8 + b];
+                  if (got_byte != exp_byte) {
+                      errors++;
+                      printf("MISMATCH @(%d,%d) HW=0x%02x EXP=0x%02x\n",
+                             i, j * 8 + b, got_byte, exp_byte);
+                  }
+              }
+          }
+      }
+  }
+  printf("Total errors: %d\n", errors);
+
+
 }
