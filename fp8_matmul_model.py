@@ -84,7 +84,9 @@ def float_quantize_trunc(x: Tensor, exp: int, man: int) -> Tensor:
     E = torch.floor(log2_ax)
     bias = (1 << (exp - 1)) - 1
     emin = 1 - bias
-    emax = bias
+    # MX FP8 E4M3: biased_exp goes up to 15 (unbiased=8), NaN=0x7F only → pmax=448
+    is_mx_fp8 = (exp == 4 and man == 3)
+    emax = bias + 1 if is_mx_fp8 else bias
     underflow_mask = E < emin
     overflow_mask = E > emax
     normal_mask = (~underflow_mask) & (~overflow_mask)
@@ -94,7 +96,9 @@ def float_quantize_trunc(x: Tensor, exp: int, man: int) -> Tensor:
         E_max = float(emax)
         base_max = torch.pow(torch.tensor(2.0, dtype=ax_nz.dtype, device=ax_nz.device), E_max)
         delta_max = base_max / (2 ** man)
-        max_val = base_max + (2 ** man - 1) * delta_max
+        # MX FP8: biased_exp=15 + mant=7 is NaN, so max normal mant=6
+        max_mant = (2 ** man - 2) if is_mx_fp8 else (2 ** man - 1)
+        max_val = base_max + max_mant * delta_max
         ax_q[overflow_mask] = max_val
     if normal_mask.any():
         E_norm = E[normal_mask]
@@ -102,7 +106,15 @@ def float_quantize_trunc(x: Tensor, exp: int, man: int) -> Tensor:
         base = torch.pow(torch.tensor(2.0, dtype=ax_nz.dtype, device=ax_nz.device), E_norm)
         delta = base / (2 ** man)
         t = (x_norm - base) / delta
-        k = torch.floor(torch.clamp(t, 0, 2 ** man - 1 - 1e-7))
+        # MX FP8: when E=8 (biased_exp=15), mant=7 would be NaN; clamp to 6
+        if is_mx_fp8:
+            at_emax = (E_norm == emax).to(ax_nz.device)
+            clamp_hi = torch.where(at_emax,
+                torch.full_like(t, 2 ** man - 2 - 1e-7),
+                torch.full_like(t, 2 ** man - 1 - 1e-7))
+            k = torch.floor(torch.clamp(t, torch.zeros_like(t), clamp_hi))
+        else:
+            k = torch.floor(torch.clamp(t, 0, 2 ** man - 1 - 1e-7))
         ax_q[normal_mask] = base + k * delta
     out[nz_mask] = sign[nz_mask] * ax_q
     return out
@@ -128,7 +140,9 @@ def tensor_to_custom_fp_codes(t: Tensor, spec: str) -> Tuple[List[List[int]], in
     total_bits = 1 + e_bits + m_bits
     bias = (1 << (e_bits - 1)) - 1
     emin = 1 - bias
-    emax = bias
+    # MX FP8 E4M3: biased_exp goes up to 15 (unbiased=8), NaN=0x7F only → pmax=448
+    is_mx_fp8 = (e_bits == 4 and m_bits == 3)
+    emax = bias + 1 if is_mx_fp8 else bias
     arr = t.detach().cpu()
     if arr.ndim == 1:
         arr = arr.unsqueeze(0)
@@ -151,14 +165,27 @@ def tensor_to_custom_fp_codes(t: Tensor, spec: str) -> Tuple[List[List[int]], in
                 else:
                     if E > emax:
                         E_used = emax
-                        mant = (2 ** m_bits) - 1
+                        # MX FP8: biased_exp=15 + mant=7 is NaN, so max normal mant=6
+                        mant = (2 ** m_bits) - 2 if is_mx_fp8 else (2 ** m_bits) - 1
                     else:
                         E_used = E
                         base = 2.0 ** E_used
                         delta = base / (2 ** m_bits)
                         tpos = (av - base) / delta
                         mant = int(round(tpos))
-                        mant = max(0, min(mant, 2 ** m_bits - 1))
+                        if mant >= 2 ** m_bits:
+                            # Rounding carry: banker's rounding pushed mant over the top (e.g. 7.5→8).
+                            # Increment exponent and reset mantissa instead of clamping.
+                            E_used += 1
+                            mant = 0
+                            if E_used > emax:
+                                # Carry pushed past pmax: clip to max representable
+                                E_used = emax
+                                mant = (2 ** m_bits) - 2 if is_mx_fp8 else (2 ** m_bits) - 1
+                        else:
+                            # MX FP8: at biased_exp=15 (E=8), mant=7 would be NaN; clamp to 6
+                            max_mant = (2 ** m_bits) - 2 if (is_mx_fp8 and E_used == emax) else (2 ** m_bits) - 1
+                            mant = max(0, min(mant, max_mant))
                     exp_bits_val = int(E_used + bias)
                     code = ((s & 0x1) << (e_bits + m_bits)) | \
                            ((exp_bits_val & ((1 << e_bits) - 1)) << m_bits) | \
@@ -382,47 +409,34 @@ def _po2(x: Tensor) -> Tensor:
         out[nz] = torch.pow(2.0, exp)
     return out
 
-def matrix_mx_requantize(matrix: Tensor, quant_spec: str = INPUT_SPEC) -> Tuple[Tensor, Tensor]:
-    """
-    Requantize each block of 32 columns independently.
-    Returns:
-        quantized matrix (M, N)
-        scales (M, N//32) — one power-of-2 scale per row per 32-col block
-    """
+def matrix_mx_requantize(matrix, quant_spec=INPUT_SPEC):
     M, N = matrix.shape
-    assert N % GROUP == 0
     nblocks = N // GROUP
-
     e_bits, m_bits = parse_fp_spec(quant_spec)
-    max_representable = (2.0 ** ((1 << (e_bits - 1)) - 1)) * (2.0 - 2.0 ** (-m_bits))
+    # max_representable = 2^emax * (2 - 2^-m) = 2^8 * 1.75 = 448
+    emax = (1 << (e_bits - 1))  # = 8 for e4m3
+    log2_pmax = emax  # floor(log2(448)) = 8
 
-    q_fn = make_fp_quantizer(quant_spec, rounding="zero")
     scale_q_fn = make_fp_quantizer(SCALE_SPEC, "nearest")
 
     C_quantized = torch.zeros_like(matrix)
-    C_scales = torch.zeros(M, nblocks, dtype=torch.float32)
+    C_scales = torch.zeros(M, nblocks)
 
     for bi in range(nblocks):
-        c0 = bi * GROUP
-        c1 = c0 + GROUP
-        block = matrix[:, c0:c1]  # (M, 32)
-
-        # Per-row max absolute value within this 32-col block
-        block_max = block.abs().amax(dim=1, keepdim=True)  # (M, 1)
-
-        # Power-of-2 scale: largest po2 such that block_max / scale <= max_representable
-        # scale = po2(block_max / max_representable)
-        raw_scale = block_max / max_representable
-        scale = _po2(raw_scale)
-        scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+        block = matrix[:, bi*GROUP:(bi+1)*GROUP]
+        block_max = block.abs().amax(dim=1, keepdim=True)
+        # Match HW: extract exponent of block_max, subtract log2_pmax
+        max_exp = torch.floor(torch.log2(block_max.clamp(min=1e-45)))
+        scale_exp = max_exp - log2_pmax
+        scale = torch.pow(2.0, scale_exp)
         scale = scale_q_fn(scale)
 
-        # Quantize the block
-        scaled_block = block / scale
-        C_quantized[:, c0:c1] = q_fn(scaled_block)
+        # Store scaled BF16 values; tensor_to_custom_fp_codes handles MX FP8 rounding/encoding
+        C_quantized[:, bi*GROUP:(bi+1)*GROUP] = block / scale
         C_scales[:, bi] = scale.squeeze(1)
 
     return C_quantized, C_scales
+
 
 # --- Entry point ---
 

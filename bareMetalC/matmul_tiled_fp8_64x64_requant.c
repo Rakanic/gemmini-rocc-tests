@@ -174,6 +174,7 @@ int main() {
       uint8_t exp = C_out[i][j];
       if (got != exp) {
         errors++;
+        printf("Output[%d][%d], Got: %x, Exp: %x\n", i, j, got, exp);
         int bits = popcount8(got ^ exp);
         if      (bits == 1) diff1++;
         else if (bits == 2) diff2++;
