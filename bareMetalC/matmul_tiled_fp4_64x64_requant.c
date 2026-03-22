@@ -8,12 +8,15 @@
 #endif
 
 #include "include/gemmini_testutils.h"
-#include "include/matmul_fp8_64x64.h"
+#include "include/matmul_fp4_64x64.h"
 
 #define GEMMINI_SF_MEM 0x40088000
 #define GEMMINI_SF_MEM_A (GEMMINI_SF_MEM + 0x2000)
 #define GEMMINI_SF_MEM_B GEMMINI_SF_MEM
 #define SMEM 0x40000000
+
+#undef GEMMINI_BUSY_ADDR
+#define GEMMINI_BUSY_ADDR (GEMMINI_CTRL + 0x20)
 
 #define DIM 16
 
@@ -30,6 +33,11 @@
 }
 
 #define ADDR_LEN 32
+
+#undef gemmini_fence
+//#define gemmini_fence() { while (gemmini_status()); }
+#define gemmini_fence() { while (*((volatile uint32_t *) GEMMINI_BUSY_ADDR)) asm volatile ("nop"); }
+
 
 // BF16 values packed 4 per uint64_t output word
 #define BF16_PER_WORD 4
@@ -70,8 +78,8 @@ int main() {
   memset(C_hw, 0, sizeof(C_hw));
 
   // ---- Tile dimensions ----
-  int tiles_I = MATMUL_M / DIM;
-  int tiles_J = MATMUL_N / DIM;
+  int tiles_I = MATMUL_M / DIM / 2;
+  int tiles_J = MATMUL_N / DIM / 2;
   int tiles_K = MATMUL_K / DIM;
 
   uint32_t a_base = 0;
@@ -80,7 +88,7 @@ int main() {
 
   // ---- Gemmini setup ----
   gemmini_flush(0);
-  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 0, 0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 2, 2, 2, 0);
 
   // ---- Load scale factors ----
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, 1024);
@@ -91,24 +99,25 @@ int main() {
 
   for (int i = 0; i < tiles_I; i++) {
     for (int k = 0; k < tiles_K; k++) {
-      elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_M + k * DIM;
+      elem_t *dram_ptr = ((elem_t*)A_in_hw) + i * DIM * MATMUL_M + k * DIM;
       uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
       gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
     }
   }
 
+  gemmini_config_ld(MATMUL_N * sizeof(elem_t) / 2)
   // ---- MVIN B: tile (k,j) -> b_base + (j*tiles_K + k)*DIM ----
-  for (int j = 0; j < tiles_J; j++) {
-    for (int k = 0; k < tiles_K; k++) {
-      elem_t *dram_ptr = ((elem_t*)B_in) + j * DIM * MATMUL_M + k * DIM;
-      uint32_t sp_addr = b_base + (j * tiles_K + k) * DIM;
+  for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j++) {
+      elem_t *dram_ptr = ((elem_t*)B_in) + k * DIM * MATMUL_N / 2 + j * DIM;
+      uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
       gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
     }
   }
 
   int SPAD_DEST = 128;
 
-  gemmini_config_st(1 * sizeof(out_t));
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
   gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
 
   // ---- Compute ----
@@ -168,14 +177,30 @@ int main() {
   int diff1 = 0, diff2 = 0, diff3plus = 0;
   uint8_t *hw_bytes = (uint8_t *)C_hw;
 
-  for (int i = 0; i < MATMUL_M; i++) {
+  for (int i = 0; i < MATMUL_M/2; i++) {
     for (int j = 0; j < MATMUL_N; j++) {
       uint8_t got = hw_bytes[i * MATMUL_N + j];
       uint8_t exp = C_out[i][j];
-      if (got != exp) {
+
+      // Check low nibble
+      uint8_t got_lo = got & 0x0F;
+      uint8_t exp_lo = exp & 0x0F;
+      if (got_lo != exp_lo) {
         errors++;
-        printf("Output[%d][%d], Got: %x, Exp: %x\n", i, j, got, exp);
-        int bits = popcount8(got ^ exp);
+        int bits = popcount8(got_lo ^ exp_lo);
+        if (got_lo - exp_lo > 1) printf("C_out[%d][%d]: got: %x, exp: %x \n", i, j, got_lo, exp_lo);
+        if      (bits == 1) diff1++;
+        else if (bits == 2) diff2++;
+        else                diff3plus++;
+      }
+
+      // Check high nibble
+      uint8_t got_hi = (got >> 4) & 0x0F;
+      uint8_t exp_hi = (exp >> 4) & 0x0F;
+      if (got_hi != exp_hi) {
+        errors++;
+        int bits = popcount8(got_hi ^ exp_hi);
+        if (got_hi - exp_hi > 1) printf("C_out[%d][%d]: got: %x, exp: %x \n", i, j, got_hi, exp_hi);
         if      (bits == 1) diff1++;
         else if (bits == 2) diff2++;
         else                diff3plus++;
