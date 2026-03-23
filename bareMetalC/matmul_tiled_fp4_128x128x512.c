@@ -73,7 +73,7 @@ int main() {
 #endif
 
   // ---- Output buffer ----
-  static out_t C_hw[MATMUL_M][MATMUL_N/8];
+  static out_t C_hw[MATMUL_M][OUT_COLS];
   uint32_t scale_factors[512] __attribute__((aligned(32))) = {0};
   memset(C_hw, 0, sizeof(C_hw));
 
@@ -88,7 +88,7 @@ int main() {
 
   // ---- Gemmini setup ----
   gemmini_flush(0);
-  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 2, 2, 2, 0);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 2, 2, 3, 0);
 
   // ---- Load scale factors ----
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, 2048);
@@ -142,51 +142,41 @@ int main() {
 //      gemmini_mvout((void *) dram_ptr, acc_tile_addr);
 //    }
 //  }
+
+
   gemmini_fence();
 
   uint64_t* smem_start_addr = ((uint64_t*)SMEM) + SPAD_DEST * 2;
   printf("Address: %p \n", smem_start_addr);
   for (int i = 0; i < MATMUL_M; i ++) {
-    for (int j = 0; j < MATMUL_N / 8; j++) {
+    for (int j = 0; j < OUT_COLS; j++) {
 //       printf("addr: %p \n", smem_start_addr + (i*8 + j) );
 //       printf("Elem: %d = %lx \n", i * MATMUL_M + j, *(smem_start_addr + (i*OUT_COLS + j)));
-        C_hw[i][j] = *(smem_start_addr + (i*MATMUL_N / 8 + j));
+        C_hw[i][j] = *(smem_start_addr + (i*OUT_COLS + j));
     }
   }
 
-
-// ---- Elementwise check against C_out (fp8, byte-by-byte) ----
   int errors = 0;
-  int diff1 = 0, diff2 = 0, diff3plus = 0;
-  uint8_t *hw_bytes = (uint8_t *)C_hw;
+  for (int i = 0; i < MATMUL_M; i++) {
+    for (int j = 0; j < OUT_COLS; j++) {
+      uint64_t got = C_hw[i][j];
 
-  for (int i = 0; i < MATMUL_M/2; i++) {
-    for (int j = 0; j < MATMUL_N; j++) {
-      uint8_t got = hw_bytes[i * MATMUL_N + j];
-      uint8_t exp = C_out[i][j];
+      // Pack 4 consecutive bf16 golden values into expected uint64_t
+      uint64_t exp = ((uint64_t)C_out_bf16[i][j*4 + 3] << 48) |
+                     ((uint64_t)C_out_bf16[i][j*4 + 2] << 32) |
+                     ((uint64_t)C_out_bf16[i][j*4 + 1] << 16) |
+                     ((uint64_t)C_out_bf16[i][j*4 + 0]);
 
-      // Check low nibble
-      uint8_t got_lo = got & 0x0F;
-      uint8_t exp_lo = exp & 0x0F;
-      if (got_lo != exp_lo) {
-        errors++;
-        int bits = popcount8(got_lo ^ exp_lo);
-        printf("C_out[%d][%d]: got: %x, exp: %x \n", i, j, got_lo, exp_lo);
-        if      (bits == 1) diff1++;
-        else if (bits == 2) diff2++;
-        else                diff3plus++;
-      }
-
-      // Check high nibble
-      uint8_t got_hi = (got >> 4) & 0x0F;
-      uint8_t exp_hi = (exp >> 4) & 0x0F;
-      if (got_hi != exp_hi) {
-        errors++;
-        int bits = popcount8(got_hi ^ exp_hi);
-        printf("C_out[%d][%d]: got: %x, exp: %x \n", i, j, got_hi, exp_hi);
-        if      (bits == 1) diff1++;
-        else if (bits == 2) diff2++;
-        else                diff3plus++;
+      if (got != exp) {
+        for (int lane = 0; lane < BF16_PER_WORD; lane++) {
+          uint16_t got_bf16 = (got >> (lane * 16)) & 0xFFFF;
+          uint16_t exp_bf16 = C_out_bf16[i][j * BF16_PER_WORD + lane];
+          if (got_bf16 != exp_bf16) {
+            printf("MISMATCH @(%d,%d) HW=0x%04x EXP=0x%04x\n",
+                   i, j * BF16_PER_WORD + lane, got_bf16, exp_bf16);
+            errors++;
+          }
+        }
       }
     }
   }
@@ -195,10 +185,8 @@ int main() {
     printf("fp8 WS matmul test PASSED (no mismatches).\n");
   } else {
     printf("fp8 WS matmul test FAILED with %d mismatches.\n", errors);
-    printf("  differ by 1 bit:   %d\n", diff1);
-    printf("  differ by 2 bits:  %d\n", diff2);
-    printf("  differ by 3+ bits: %d\n", diff3plus);
   }
+
 
 #ifndef BAREMETAL
   exit(errors != 0);
