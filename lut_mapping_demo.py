@@ -19,7 +19,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, ".")
-from fp_decoder import ieee_to_recfn
+# from fp_decoder import ieee_to_recfn
 from fp_decoder import recfn_to_ieee
 import fp8_matmul_model
 from fp8_matmul_model import matmul_outer_quantized_hwlike, compute_tile_scale_matrix, tiled_matmul_hwlike
@@ -34,30 +34,31 @@ from golden_model import (
     q_bf16_rne,
     hw_add_bf16,
     parse_fp_spec,
+    pack_lut_hw_words,
     write_c_header_tiled_hw,
     compute_tile_scale_matrix_fpe8m0,
     _a_indices_to_hw_layout,
 )
 
-def bf16_tensor_to_recfn_hex(t: torch.Tensor) -> list:
-    """Convert float32 tensor (on BF16 grid) to HardFloat recFN hex strings (17-bit, 5 hex digits)."""
-    raw = t.to(torch.bfloat16).view(torch.uint8)
-    # reconstruct 16-bit IEEE BF16 values (little-endian pairs)
-    rows = []
-    flat = t.to(torch.bfloat16).reshape(-1)
-    import struct
-    for val in flat:
-        ieee = struct.unpack('<H', struct.pack('<e', float(val.to(torch.float32))))[0]
-        # bfloat16 raw bits via view
-        buf = val.view(torch.int16).item() & 0xFFFF
-        rec = ieee_to_recfn(buf, exp_bits=8, mant_bits_total=8)
-        rows.append(f"{rec:05x}")
-    shape = t.shape
-    result, idx = [], 0
-    for i in range(shape[0]):
-        result.append([rows[idx + j] for j in range(shape[1])])
-        idx += shape[1]
-    return result
+# def bf16_tensor_to_recfn_hex(t: torch.Tensor) -> list:
+#     """Convert float32 tensor (on BF16 grid) to HardFloat recFN hex strings (17-bit, 5 hex digits)."""
+#     raw = t.to(torch.bfloat16).view(torch.uint8)
+#     # reconstruct 16-bit IEEE BF16 values (little-endian pairs)
+#     rows = []
+#     flat = t.to(torch.bfloat16).reshape(-1)
+#     import struct
+#     for val in flat:
+#         ieee = struct.unpack('<H', struct.pack('<e', float(val.to(torch.float32))))[0]
+#         # bfloat16 raw bits via view
+#         buf = val.view(torch.int16).item() & 0xFFFF
+#         rec = ieee_to_recfn(buf, exp_bits=8, mant_bits_total=8)
+#         rows.append(f"{rec:05x}")
+#     shape = t.shape
+#     result, idx = [], 0
+#     for i in range(shape[0]):
+#         result.append([rows[idx + j] for j in range(shape[1])])
+#         idx += shape[1]
+#     return result
 
 # ── Parameters (edit to match your run) ───────────────────────────────────────
 SEED           = 0
@@ -286,16 +287,10 @@ for k_base in range(0, K, K_TILE):
                 S_codes, S_bits = tensor_to_custom_fp_codes(S_joint[:DEBUG_R, :DEBUG_R], SCALE_SPEC)
                 S_hex = codes_to_hex_rows(S_codes, S_bits)
                 print(f"\n--- Joint scale S_tile[:{DEBUG_R},:{DEBUG_R}] ({SCALE_SPEC} hex | float) ---")
-<<<<<<< HEAD
-                for r in range(DEBUG_R):
-                    hex_row   = S_hex[r]
-                    float_row = [f"{S_joint[r, c].item():>8.4f}" for c in range(DEBUG_R)]
-=======
                 S_joint_sub = S_joint[:DEBUG_R, :DEBUG_R]
                 for r in range(min(DEBUG_R, S_joint.shape[0])):
                     hex_row   = S_hex[r]
                     float_row = [f"{S_joint_sub[r, c].item():>8.4f}" for c in range(min(DEBUG_R, S_joint.shape[1]))]
->>>>>>> 33b4521c (adding fp6 test case)
                     print(f"  row{r}: {hex_row}  |  {float_row}")
                 print(f"\n--- A scales[:{DEBUG_R}] float | hex ---")
                 print([f"{v.item():.4f} ({h[0]})" for v, h in zip(sA[:DEBUG_R], sA_hex)])
@@ -331,10 +326,10 @@ for k_base in range(0, K, K_TILE):
                         for row in c_hex:
                             print(f"    {row}")
                         #print(f"  C[:{DEBUG_R},:{DEBUG_R}]  bf16={c_hex}")
-                        c_rec = bf16_tensor_to_recfn_hex(C_before_hw[:DEBUG_R, :DEBUG_R])
-                        print(f"  C[:{DEBUG_R},:{DEBUG_R}]  recfn:")
-                        for row in c_rec:
-                            print(f"    {row}")
+                        # c_rec = bf16_tensor_to_recfn_hex(C_before_hw[:DEBUG_R, :DEBUG_R])
+                        # print(f"  C[:{DEBUG_R},:{DEBUG_R}]  recfn:")
+                        # for row in c_rec:
+                        #     print(f"    {row}")
 
                 # ── Every K_TILE: per-tile + cumulative accumulation ──────────
                 _pq_all = make_fp_quantizer(INPUT_SPEC, "zero")
@@ -438,13 +433,7 @@ print("\n[Step 7]: Requantize C_golden_bf16 via matrix_mx_requantize")
 from fp8_matmul_model import matrix_mx_requantize
 C_requantized, C_req_scales = matrix_mx_requantize(
         C_golden_bf16,
-<<<<<<< HEAD
-        quant_spec=INPUT_SPEC,
-        group_size=GROUP,
-        Gk=Gk)
-=======
         quant_spec=INPUT_SPEC)
->>>>>>> 33b4521c (adding fp6 test case)
 print(f"  quant_spec: {INPUT_SPEC}  scale_spec: {SCALE_SPEC}")
 # print(f"  C_requantized shape: {list(C_requantized.shape)}  C_req_scales shape: {list(C_req_scales.shape)}")
 # req_codes, req_bits = tensor_to_custom_fp_codes(C_requantized, INPUT_SPEC)
@@ -525,19 +514,6 @@ for mg in range(min(NUM_PRINT_MGRP, M >> G)):
         lut_looked_up= [f"{C_luts_t[mg, indices[i]].item():.4f}" for i in range(NUM_PRINT_COLS)]
         print(f"    row {m:3d}: fp6={fp6_hex}  ->  idx={indices}  ->  lut_val={lut_looked_up}")
 
-<<<<<<< HEAD
-print("\n--- C_proj flat [M, N] (4-bit indices) ---")
-for m in range(M):
-    flat_hex = " ".join(f"{C_proj[m, n].item():x}" for n in range(N))
-    print(f"  row {m:3d}: {flat_hex}")
-
-print("\n--- C_proj A_in HW layout [M//2, N] (bits[3:0]=even row, bits[7:4]=odd row per col) ---")
-C_proj_hw = _a_indices_to_hw_layout(C_proj, a_tile_m=A_TILE_M, k_tile=K_TILE)  # [M//2, N]
-for r in range(M // 2):
-    hw_hex = " ".join(f"{C_proj_hw[r][n]:02x}" for n in range(N))
-    print(f"  hw row {r:3d}: {hw_hex}")
-    
-=======
 print("\n--- C_req_codes_raw first 32 rows (fp6 codes, hex) ---")
 for m in range(min(128, M)):
     groups = [" ".join(f"{C_req_codes_raw[m][n]:02x}" for n in range(g, min(g + 32, N)))
@@ -561,7 +537,6 @@ for m in range(min(64, M)):
               for g in range(0, N, 32)]
     print(f"  row {m:3d}: " + " | ".join(groups))
 
->>>>>>> 33b4521c (adding fp6 test case)
 print("\n[Step 9]: Write header with C_lut, C_proj indices, and C scales")
 write_c_header_tiled_hw(
     path           = "./include/matmul_data_mx_lut_hw.h",
