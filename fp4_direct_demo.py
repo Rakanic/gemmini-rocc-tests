@@ -121,6 +121,9 @@ def write_c_header_fp4_direct(
     if C_out_quantized is not None:
         Cq_packed = _a_indices_to_hw_layout(C_out_quantized, a_tile_m, k_tile)  # [M//2, N]
         Cq_hex = codes_to_hex_rows(Cq_packed, 8)
+    
+    if C_out_quantized is not None:
+        Cq_hex_full = codes_to_hex_rows(C_out_quantized, 8)
 
     if C_out_scales is not None:
         Cqs_codes, Cqs_bits = tensor_to_custom_fp_codes(C_out_scales.transpose(0, 1), scale_spec)
