@@ -188,7 +188,7 @@ int main() {
       if (got_lo != exp_lo) {
         errors++;
         int bits = popcount8(got_lo ^ exp_lo);
-        if (got_lo - exp_lo > 1) printf("C_out[%d][%d]: got: %x, exp: %x \n", i, j, got_lo, exp_lo);
+        printf("C_out[%d][%d]: got: %x, exp: %x \n", i, j, got_lo, exp_lo);
         if      (bits == 1) diff1++;
         else if (bits == 2) diff2++;
         else                diff3plus++;
@@ -200,7 +200,7 @@ int main() {
       if (got_hi != exp_hi) {
         errors++;
         int bits = popcount8(got_hi ^ exp_hi);
-        if (got_hi - exp_hi > 1) printf("C_out[%d][%d]: got: %x, exp: %x \n", i, j, got_hi, exp_hi);
+        printf("C_out[%d][%d]: got: %x, exp: %x \n", i, j, got_hi, exp_hi);
         if      (bits == 1) diff1++;
         else if (bits == 2) diff2++;
         else                diff3plus++;
