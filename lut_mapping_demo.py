@@ -286,9 +286,16 @@ for k_base in range(0, K, K_TILE):
                 S_codes, S_bits = tensor_to_custom_fp_codes(S_joint[:DEBUG_R, :DEBUG_R], SCALE_SPEC)
                 S_hex = codes_to_hex_rows(S_codes, S_bits)
                 print(f"\n--- Joint scale S_tile[:{DEBUG_R},:{DEBUG_R}] ({SCALE_SPEC} hex | float) ---")
+<<<<<<< HEAD
                 for r in range(DEBUG_R):
                     hex_row   = S_hex[r]
                     float_row = [f"{S_joint[r, c].item():>8.4f}" for c in range(DEBUG_R)]
+=======
+                S_joint_sub = S_joint[:DEBUG_R, :DEBUG_R]
+                for r in range(min(DEBUG_R, S_joint.shape[0])):
+                    hex_row   = S_hex[r]
+                    float_row = [f"{S_joint_sub[r, c].item():>8.4f}" for c in range(min(DEBUG_R, S_joint.shape[1]))]
+>>>>>>> 33b4521c (adding fp6 test case)
                     print(f"  row{r}: {hex_row}  |  {float_row}")
                 print(f"\n--- A scales[:{DEBUG_R}] float | hex ---")
                 print([f"{v.item():.4f} ({h[0]})" for v, h in zip(sA[:DEBUG_R], sA_hex)])
@@ -332,6 +339,7 @@ for k_base in range(0, K, K_TILE):
                 # ── Every K_TILE: per-tile + cumulative accumulation ──────────
                 _pq_all = make_fp_quantizer(INPUT_SPEC, "zero")
                 C_cumulative = None
+                C_cumulative_wide = None  # tracks [:DEBUG_R, :N] across K tiles
                 for t, kb in enumerate(range(0, K, K_TILE)):
                     # single tile accumulation (no scale)
                     c_tile = None
@@ -343,6 +351,9 @@ for k_base in range(0, K, K_TILE):
                             c_tile = hw_add_bf16(prod, c_tile)
                     
                     c_tile_r = c_tile[:DEBUG_R, :DEBUG_R]
+                    # wide cumulative (no scale) across all N cols
+                    c_tile_wide = c_tile[:DEBUG_R, :]
+                    C_cumulative_wide = c_tile_wide if C_cumulative_wide is None else hw_add_bf16(C_cumulative_wide, c_tile_wide)
                     # scale and accumulate
                     St = compute_tile_scale_matrix(
                         A_scales_row_q, B_scales_col_q,
@@ -355,16 +366,24 @@ for k_base in range(0, K, K_TILE):
                     scaled_codes, scaled_bits = tensor_to_custom_fp_codes(c_tile_scaled, "bf16")
                     cum_codes, cum_bits = tensor_to_custom_fp_codes(C_cumulative, "bf16")
                    
+                    def fmt_row(hex_list, sep=32):
+                        groups = [" ".join(hex_list[g:g+sep]) for g in range(0, len(hex_list), sep)]
+                        return " | ".join(groups)
+
                     print(f"\n=== K_TILE {t+1} (k={kb}..{kb+K_TILE-1}) ===")
                     print(f"  tile (no scale):")
                     for row in codes_to_hex_rows(tile_codes, tile_bits):
-                            print(f"    {row}")
+                        print(f"    {fmt_row(row)}")
                     print(f"  tile (scaled):")
                     for row in codes_to_hex_rows(scaled_codes, scaled_bits):
-                            print(f"    {row}")
+                        print(f"    {fmt_row(row)}")
                     print(f"  cumulative tiles 1..{t+1}:")
                     for row in codes_to_hex_rows(cum_codes, cum_bits):
-                            print(f"    {row}")
+                        print(f"    {fmt_row(row)}")
+                    wide_codes, wide_bits = tensor_to_custom_fp_codes(C_cumulative_wide, "bf16")
+                    print(f"  cumulative (all N cols, no scale) tiles 1..{t+1}:")
+                    for i, row in enumerate(codes_to_hex_rows(wide_codes, wide_bits)):
+                        print(f"    row{i:>2}: {fmt_row(row)}")
                 # exit()
 
 
@@ -419,9 +438,13 @@ print("\n[Step 7]: Requantize C_golden_bf16 via matrix_mx_requantize")
 from fp8_matmul_model import matrix_mx_requantize
 C_requantized, C_req_scales = matrix_mx_requantize(
         C_golden_bf16,
+<<<<<<< HEAD
         quant_spec=INPUT_SPEC,
         group_size=GROUP,
         Gk=Gk)
+=======
+        quant_spec=INPUT_SPEC)
+>>>>>>> 33b4521c (adding fp6 test case)
 print(f"  quant_spec: {INPUT_SPEC}  scale_spec: {SCALE_SPEC}")
 # print(f"  C_requantized shape: {list(C_requantized.shape)}  C_req_scales shape: {list(C_req_scales.shape)}")
 # req_codes, req_bits = tensor_to_custom_fp_codes(C_requantized, INPUT_SPEC)
@@ -502,6 +525,7 @@ for mg in range(min(NUM_PRINT_MGRP, M >> G)):
         lut_looked_up= [f"{C_luts_t[mg, indices[i]].item():.4f}" for i in range(NUM_PRINT_COLS)]
         print(f"    row {m:3d}: fp6={fp6_hex}  ->  idx={indices}  ->  lut_val={lut_looked_up}")
 
+<<<<<<< HEAD
 print("\n--- C_proj flat [M, N] (4-bit indices) ---")
 for m in range(M):
     flat_hex = " ".join(f"{C_proj[m, n].item():x}" for n in range(N))
@@ -513,6 +537,31 @@ for r in range(M // 2):
     hw_hex = " ".join(f"{C_proj_hw[r][n]:02x}" for n in range(N))
     print(f"  hw row {r:3d}: {hw_hex}")
     
+=======
+print("\n--- C_req_codes_raw first 32 rows (fp6 codes, hex) ---")
+for m in range(min(128, M)):
+    groups = [" ".join(f"{C_req_codes_raw[m][n]:02x}" for n in range(g, min(g + 32, N)))
+              for g in range(0, N, 32)]
+    print(f"  row {m:3d}: " + " | ".join(groups))
+
+print("\n--- C_golden_bf16 first 32 rows (bf16 hex) ---")
+for m in range(min(128, M)):
+    groups = [" ".join(f"{C_golden_bf16[m, n].to(torch.bfloat16).view(torch.int16).item() & 0xFFFF:04x}"
+                       for n in range(g, min(g + 32, N)))
+              for g in range(0, N, 32)]
+    print(f"  row {m:3d}: " + " | ".join(groups))
+
+print("\n--- C_proj A_in HW layout [M//2, N] (bits[3:0]=even row, bits[7:4]=odd row per col) ---")
+C_proj_hw = _a_indices_to_hw_layout(C_proj, a_tile_m=A_TILE_M, k_tile=K_TILE)  # [M//2, N]
+# for r in range(M // 2):
+#     hw_hex = " ".join(f"{C_proj_hw[r][n]:02x}" for n in range(N))
+#     print(f"  hw row {r:3d}: {hw_hex}")
+for m in range(min(64, M)):
+    groups = [" ".join(f"{C_proj_hw[m][n]:02x}" for n in range(g, min(g + 32, N)))
+              for g in range(0, N, 32)]
+    print(f"  row {m:3d}: " + " | ".join(groups))
+
+>>>>>>> 33b4521c (adding fp6 test case)
 print("\n[Step 9]: Write header with C_lut, C_proj indices, and C scales")
 write_c_header_tiled_hw(
     path           = "./include/matmul_data_mx_lut_hw.h",
