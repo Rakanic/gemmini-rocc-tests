@@ -15,6 +15,7 @@ So each byte stores two indices:
 
 import sys
 import random
+from pathlib import Path
 import numpy as np
 import torch
 
@@ -74,6 +75,28 @@ QUANT_LUT_UPDATE_GRANULARITY = 1  # every 2^g rows of A / cols of B share one LU
 Gk             = K // GROUP
 DEBUG_R        = 4             # print first DEBUG_R x DEBUG_R elements in debug blocks
 # ──────────────────────────────────────────────────────────────────────────────
+
+def _tensor_u8_bytes(t) -> bytes:
+    arr = torch.as_tensor(t, dtype=torch.uint8).contiguous().cpu().numpy()
+    return arr.tobytes(order="C")
+
+def _tensor_u16_bytes(t) -> bytes:
+    arr = torch.as_tensor(t, dtype=torch.uint16).contiguous().cpu().numpy()
+    return arr.tobytes(order="C")
+
+def write_tensor_bins(base_dir: str, A_indices: torch.Tensor, B_indices: torch.Tensor,
+                      C_proj_hw: torch.Tensor, C_out_bf16: torch.Tensor) -> None:
+    out_dir = Path(base_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    A_in_hw = _a_indices_to_hw_layout(A_indices, a_tile_m=A_TILE_M, k_tile=K_TILE)
+    B_in_hw = ((B_indices[:, 1::2] << 4) | B_indices[:, 0::2]).to(torch.uint8)
+    C_out_bf16_bits = C_out_bf16.detach().to(torch.bfloat16).view(torch.uint16)
+
+    (out_dir / "A_in.bin").write_bytes(_tensor_u8_bytes(A_in_hw))
+    (out_dir / "B_in.bin").write_bytes(_tensor_u8_bytes(B_in_hw))
+    (out_dir / "C_out_proj_hw.bin").write_bytes(_tensor_u8_bytes(C_proj_hw))
+    (out_dir / "C_out_bf16.bin").write_bytes(_tensor_u16_bytes(C_out_bf16_bits))
 
 
 # ── Reproduce A, B with the same seed as run_experiment ───────────────────────
@@ -602,3 +625,6 @@ content = content.replace(f"#endif // {guard}\n", c_proj_hw_section)
 with open(HEADER_PATH, "w") as f:
     f.write(content)
 print("C_proj_hw appended to header.")
+
+write_tensor_bins(Path.cwd(), A_indices, B_indices, C_proj_hw, C_out_bf16)
+print(f"Binary tensors written to {Path.cwd()}")
