@@ -45,6 +45,8 @@
 #define GEMMINI_SPAD_ADDR_B 0x0
 #define GEMMINI_ACC_BASE_ADDR 0x80000000
 #define GEMMINI_ACC_ADDR_C GEMMINI_ACC_BASE_ADDR
+#define BF16_PER_WORD 4
+#define OUT_COLS (MATMUL_M / BF16_PER_WORD)
 
 #define GEMMINI_FORMAT_FP8
 #define GEMMINI_FORMAT_FP6
@@ -85,10 +87,14 @@ void load_scale_factors(volatile uint64_t *sf_mem, uint8_t *scale_factors, int n
   }
 }
 
-void load_lut(volatile uint32_t *lut_mem, uint8_t *lut) {
-  lut_mem[0] = (uint32_t) (lut[0] | (lut[1] << 6) | (lut[2] << 12) | (lut[3] << 18) | (lut[4] << 24) | (lut[5] << 30));
-  lut_mem[1] = (uint32_t) ((lut[5] >> 2) | (lut[6] << 4) | (lut[7] << 10) | (lut[8] << 16) | (lut[9] << 22) | (lut[10] << 28));
-  lut_mem[2] = (uint32_t) ((lut[10] >> 4) | (lut[11] << 2) | (lut[12] << 8) | (lut[13] << 14) | (lut[14] << 20) | (lut[15] << 26));
+
+static inline int popcount8(uint8_t x) {
+  int count = 0;
+  while (x) {
+    count += x & 1;
+    x >>= 1;
+  }
+  return count;
 }
 
 int main() {
@@ -99,7 +105,7 @@ int main() {
   }
 #endif
   static uint32_t scale_factors[MATMUL_M * MATMUL_N / 32] __attribute__((aligned(32))) = {0};
-  static uint64_t C_hw[MATMUL_M/2][MATMUL_N/8];
+  static uint64_t C_hw[MATMUL_M][MATMUL_N/8];
   memset(C_hw, 0, sizeof(C_hw));
 
   // Configure Gemmini
@@ -131,15 +137,18 @@ int main() {
    // MVIN B
 
 #ifdef USE_LUT_DEF
-  // A_lut[M>>G][LUT_SIZE] and B_lut[N>>G][LUT_SIZE]: one unique LUT per slot
+  // LUTs pre-packed by lut_mapping_demo.py: uint32_t [N_groups][3], direct write
   for (size_t i = 0; i < (MATMUL_N >> QUANT_LUT_UPDATE_GRANULARITY); i++) {
-    load_lut(((volatile uint32_t *) GEMMINI_LUT0_ADDR) + 3 * i, (uint8_t *) B_lut[i]);
+    volatile uint32_t *dst = ((volatile uint32_t *) GEMMINI_LUT0_ADDR) + 3 * i;
+    dst[0] = B_lut[i][0]; dst[1] = B_lut[i][1]; dst[2] = B_lut[i][2];
   }
   for (size_t i = 0; i < (MATMUL_M >> QUANT_LUT_UPDATE_GRANULARITY); i++) {
-    load_lut(((volatile uint32_t *) GEMMINI_LUT1_ADDR) + 3 * i, (uint8_t *) A_lut[i]);
+    volatile uint32_t *dst = ((volatile uint32_t *) GEMMINI_LUT1_ADDR) + 3 * i;
+    dst[0] = A_lut[i][0]; dst[1] = A_lut[i][1]; dst[2] = A_lut[i][2];
   }
   for (size_t i = 0; i < (MATMUL_M >> QUANT_LUT_UPDATE_GRANULARITY); i++) {
-    load_lut(((volatile uint32_t *) GEMMINI_LUT2_ADDR) + 3 * i, (uint8_t *) C_lut[i]);
+    volatile uint32_t *dst = ((volatile uint32_t *) GEMMINI_LUT2_ADDR) + 3 * i;
+    dst[0] = C_lut[i][0]; dst[1] = C_lut[i][1]; dst[2] = C_lut[i][2];
   }
 #endif
 
@@ -222,40 +231,62 @@ int main() {
   // MVOUT
   // gemmini_mvout((void *) C_hw, (1u << (ADDR_LEN - 1)));
   //gemmini_mvout_spad(dst_addr, (1u << (ADDR_LEN - 1)))
+  uint64_t* smem_start_addr = ((uint64_t*)SMEM) + SPAD_DEST * 2;
+  printf("Address: %p \n", smem_start_addr);
+  for (int i = 0; i < MATMUL_M; i ++) {
+    for (int j = 0; j < MATMUL_N / 8; j++) {
+      // printf("addr: %p \n", smem_start_addr + (i*8 + j) );
+      // printf("Elem: %d = %lx \n", i * MATMUL_M + j, *(smem_start_addr + (i*OUT_COLS + j)));
+        C_hw[i][j] = *(smem_start_addr + (i*MATMUL_N / 8 + j));
+    }
+  }
+
   gemmini_fence();
 
 
-  uint64_t* smem_start_addr = ((uint64_t*)SMEM) + SPAD_DEST * 2;
-  printf("Address: %p \n", smem_start_addr);
+   int errors = 0;
+  int diff1 = 0, diff2 = 0, diff3plus = 0;
+  uint8_t *hw_bytes = (uint8_t *)C_hw;
+
   for (int i = 0; i < MATMUL_M/2; i++) {
-      for (int j = 0; j < MATMUL_N/8; j++) {
-        C_hw[i][j] = *(smem_start_addr + i * MATMUL_N + j);
-//        printf("C_hw[%d][%d]: %lx \n", i, j, C_hw[i][j]);
-     }
+    for (int j = 0; j < MATMUL_N; j++) {
+      uint8_t got = hw_bytes[i * MATMUL_N + j];
+      uint8_t exp = C_proj_hw[i][j];
+
+      // Check low nibble
+      uint8_t got_lo = got & 0x0F;
+      uint8_t exp_lo = exp & 0x0F;
+      if (got_lo != exp_lo) {
+        errors++;
+        int bits = popcount8(got_lo ^ exp_lo);
+        printf("C_proj_hw[%d][%d]: got: %x, exp: %x \n", i, j, got_lo, exp_lo);
+        if      (bits == 1) diff1++;
+        else if (bits == 2) diff2++;
+        else                diff3plus++;
+      }
+
+      // Check high nibble
+      uint8_t got_hi = (got >> 4) & 0x0F;
+      uint8_t exp_hi = (exp >> 4) & 0x0F;
+      if (got_hi != exp_hi) {
+        errors++;
+        int bits = popcount8(got_hi ^ exp_hi);
+        printf("C_proj_hw[%d][%d]: got: %x, exp: %x \n", i, j, got_hi, exp_hi);
+        if      (bits == 1) diff1++;
+        else if (bits == 2) diff2++;
+        else                diff3plus++;
+      }
+    }
   }
 
-  int errors = 0;
-  for (int i = 0; i < MATMUL_M/2; i++) {
-      for (int j = 0; j < MATMUL_N/8; j++) {
-          uint64_t got = C_hw[i][j];
-          uint64_t exp = 0;
-          for (int b = 0; b < 8; b++) {
-              exp |= ((uint64_t)C_proj_hw[i][j * 8 + b]) << (b * 8);
-          }
-          if (got != exp) {
-              for (int b = 0; b < 8; b++) {
-                  uint8_t got_byte = (got >> (b * 8)) & 0xFF;
-                  uint8_t exp_byte = C_proj_hw[i][j * 8 + b];
-                  if (got_byte != exp_byte) {
-                      errors++;
-                      printf("MISMATCH @(%d,%d) HW=0x%02x EXP=0x%02x\n",
-                             i, j * 8 + b, got_byte, exp_byte);
-                  }
-              }
-          }
-      }
+  if (errors == 0) {
+    printf("fp6 WS matmul test PASSED (no mismatches).\n");
+  } else {
+    printf("fp6 WS matmul test FAILED with %d mismatches.\n", errors);
+    printf("  differ by 1 bit:   %d\n", diff1);
+    printf("  differ by 2 bits:  %d\n", diff2);
+    printf("  differ by 3+ bits: %d\n", diff3plus);
   }
-  printf("Total errors: %d\n", errors);
 
 
 }
