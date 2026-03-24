@@ -15,15 +15,16 @@ So each byte stores two indices:
 
 import sys
 import random
+from pathlib import Path
 import numpy as np
 import torch
 
 sys.path.insert(0, ".")
 # from fp_decoder import ieee_to_recfn
 from fp_decoder import recfn_to_ieee
-import fp8_matmul_model
-from fp8_matmul_model import matmul_outer_quantized_hwlike, compute_tile_scale_matrix, tiled_matmul_hwlike
-from golden_model import (
+import lut_fp8_matmul_model
+from lut_fp8_matmul_model import matmul_outer_quantized_hwlike, compute_tile_scale_matrix, tiled_matmul_hwlike
+from lut_golden_model import (
     make_lut,
     quantize_lut_indices,
     lut_lookup,
@@ -74,6 +75,28 @@ QUANT_LUT_UPDATE_GRANULARITY = 1  # every 2^g rows of A / cols of B share one LU
 Gk             = K // GROUP
 DEBUG_R        = 4             # print first DEBUG_R x DEBUG_R elements in debug blocks
 # ──────────────────────────────────────────────────────────────────────────────
+
+def _tensor_u8_bytes(t) -> bytes:
+    arr = torch.as_tensor(t, dtype=torch.uint8).contiguous().cpu().numpy()
+    return arr.tobytes(order="C")
+
+def _tensor_u16_bytes(t) -> bytes:
+    arr = torch.as_tensor(t, dtype=torch.uint16).contiguous().cpu().numpy()
+    return arr.tobytes(order="C")
+
+def write_tensor_bins(base_dir: str, A_indices: torch.Tensor, B_indices: torch.Tensor,
+                      C_proj_hw: torch.Tensor, C_out_bf16: torch.Tensor) -> None:
+    out_dir = Path(base_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    A_in_hw = _a_indices_to_hw_layout(A_indices, a_tile_m=A_TILE_M, k_tile=K_TILE)
+    B_in_hw = ((B_indices[:, 1::2] << 4) | B_indices[:, 0::2]).to(torch.uint8)
+    C_out_bf16_bits = C_out_bf16.detach().to(torch.bfloat16).view(torch.uint16)
+
+    (out_dir / "A_in.bin").write_bytes(_tensor_u8_bytes(A_in_hw))
+    (out_dir / "B_in.bin").write_bytes(_tensor_u8_bytes(B_in_hw))
+    (out_dir / "C_out_proj_hw.bin").write_bytes(_tensor_u8_bytes(C_proj_hw))
+    (out_dir / "C_out_bf16.bin").write_bytes(_tensor_u16_bytes(C_out_bf16_bits))
 
 
 # ── Reproduce A, B with the same seed as run_experiment ───────────────────────
@@ -186,11 +209,30 @@ mi_full = (torch.arange(M, device=DEV) >> G).unsqueeze(1).expand(-1, K)
 ni_full = (torch.arange(N, device=DEV) >> G).unsqueeze(0).expand(K, -1)
 A_fp = A_luts_t[mi_full, A_indices]                                      # (M, K)
 B_fp = B_luts_t[ni_full, B_indices]                                      # (K, N)
+
+print(f"\n[After LUT projection]")
+A_fp_codes, A_fp_bits = tensor_to_custom_fp_codes(A_fp[:DEBUG_R, :DEBUG_R], INPUT_SPEC)
+B_fp_codes, B_fp_bits = tensor_to_custom_fp_codes(B_fp[:DEBUG_R, :DEBUG_R], INPUT_SPEC)
+A_fp_hex = codes_to_hex_rows(A_fp_codes, A_fp_bits)
+B_fp_hex = codes_to_hex_rows(B_fp_codes, B_fp_bits)
+print(f"A_fp[:{DEBUG_R},:{DEBUG_R}] ({INPUT_SPEC}) [hex]:")
+for row in A_fp_hex:
+    print("  " + " ".join(row))
+print(f"A_fp[:{DEBUG_R},:{DEBUG_R}] [float]:")
+for row in A_fp[:DEBUG_R, :DEBUG_R].tolist():
+    print("  " + " ".join(f"{v:>8.4f}" for v in row))
+print(f"B_fp[:{DEBUG_R},:{DEBUG_R}] ({INPUT_SPEC}) [hex]:")
+for row in B_fp_hex:
+    print("  " + " ".join(row))
+print(f"B_fp[:{DEBUG_R},:{DEBUG_R}] [float]:")
+for row in B_fp[:DEBUG_R, :DEBUG_R].tolist():
+    print("  " + " ".join(f"{v:>8.4f}" for v in row))
+
 k_group_idx = torch.arange(K, device=DEV) // GROUP                       # (K,)
 A_fp_scaled = A_fp * A_scales_row_q[:, k_group_idx]                      # (M, K)
 B_fp_scaled = B_fp * B_scales_col_q[k_group_idx, :]                      # (K, N)
 
-fp8_matmul_model.prod_quant = make_fp_quantizer(INPUT_SPEC, "nearest")
+lut_fp8_matmul_model.prod_quant = make_fp_quantizer(INPUT_SPEC, "nearest")
 C_out = matmul_outer_quantized_hwlike(A_fp_scaled, B_fp_scaled)
 
 for k_base in range(0, K, K_TILE):
@@ -383,10 +425,10 @@ for k_base in range(0, K, K_TILE):
 
 
 print("[Step 5]: Compare C_out with tiled_matmul_hwlike golden")
-# print(fp8_matmul_model.TILE)  # should be 16 = K_TILE
-# print(fp8_matmul_model.GROUP) # should be 32 = GROUP
+# print(lut_fp8_matmul_model.TILE)  # should be 16 = K_TILE
+# print(lut_fp8_matmul_model.GROUP) # should be 32 = GROUP
 # exit()
-fp8_matmul_model.prod_quant = lambda x: x   # no fp6 prod quant — matches hardware
+lut_fp8_matmul_model.prod_quant = lambda x: x   # no fp6 prod quant — matches hardware
 C_golden = tiled_matmul_hwlike(
     A_fp, B_fp,
     A_scales_row_q, B_scales_col_q,
@@ -430,7 +472,7 @@ C_out_bf16 = q_bf16_rne(C_golden)
 print("Header written to matmul_data_mx_lut_hw.h")
 
 print("\n[Step 7]: Requantize C_golden_bf16 via matrix_mx_requantize")
-from fp8_matmul_model import matrix_mx_requantize
+from lut_fp8_matmul_model import matrix_mx_requantize
 C_requantized, C_req_scales = matrix_mx_requantize(
         C_golden_bf16,
         quant_spec=INPUT_SPEC)
@@ -583,3 +625,6 @@ content = content.replace(f"#endif // {guard}\n", c_proj_hw_section)
 with open(HEADER_PATH, "w") as f:
     f.write(content)
 print("C_proj_hw appended to header.")
+
+write_tensor_bins(Path.cwd(), A_indices, B_indices, C_proj_hw, C_out_bf16)
+print(f"Binary tensors written to {Path.cwd()}")
