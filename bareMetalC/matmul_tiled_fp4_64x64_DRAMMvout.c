@@ -117,7 +117,7 @@ int main() {
 
   int SPAD_DEST = 128;
 
-  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_config_st(2*OUT_COLS * sizeof(out_t));
   gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
 
   // ---- Compute ----
@@ -153,17 +153,16 @@ int main() {
 //    }
 //  }
 
+  gemmini_fence();
+
   for (int i = 0; i < tiles_I; i++) {
-    for (int j = 0; j < tiles_J; j++) {
+    for (int j = 0; j < tiles_J; j++) { // need 4 because 4 fit in accmem row
       uint32_t acc_tile_addr = acc_addr + (i * tiles_J + j) * DIM;
-      out_t *dram_ptr = &C_hw[i * DIM][j * (DIM / BF16_PER_WORD)];
-      gemmini_extended_mvout((void *) dram_ptr, acc_tile_addr, DIM / BF16_PER_WORD, DIM);
+      out_t *dram_ptr = &C_hw[i * 2 * DIM][j * (DIM / BF16_PER_WORD * 2)];
+      gemmini_mvout((void *) dram_ptr, acc_tile_addr);
     }
   }
 
-
-
-//  gemmini_mvout((void*)&C_hw[0][0], 128 )
 
   gemmini_fence();
 
