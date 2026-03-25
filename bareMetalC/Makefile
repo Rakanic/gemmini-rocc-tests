@@ -66,6 +66,7 @@ tests = \
 	matmul_tiled_fp4_128x128x512 \
 	matmul_tiled_fp8_64x64 \
 	matmul_tiled_fp8_64x64_DRAMMvout \
+	matmul_tiled_fp8_64x64_smem_mvout \
 	matmul_tiled_fp8_128x128 \
 	matmul_tiled_fp8_128x128x256 \
 	matmul_tiled_fp8_128x128x256_DRAMMvout \
