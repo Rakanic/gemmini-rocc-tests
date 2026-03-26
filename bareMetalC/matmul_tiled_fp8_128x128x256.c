@@ -41,19 +41,17 @@ typedef uint8_t  welem_t;  // fp8:e4m3 weight elements
 typedef uint64_t out_t;    // 4x bf16 packed per word
 
 // ---- Scale factor loader ----
-void load_scale_factors(volatile uint64_t *sf_mem, uint8_t *scale_factors, int n) {
-  for (size_t i = 0; i < n / 8; i++) {
-    sf_mem[i] = 0x7f7f7f7f7f7f7f7f;
+void load_scale_factors(volatile uint64_t *sf_mem, uint8_t *scale_factors, int INDIM, int K) {
+  for (size_t k = 0; k < K/32; k++) {
+    for (size_t i = 0; i < INDIM / 8; i++) {
+//        printf("loading: %lx\n", ((uint64_t*) scale_factors)[k * INDIM/8 + i]);
+        sf_mem[k*INDIM/8 + i] = ((uint64_t*) scale_factors)[k * INDIM/8 + i];
+    }
   }
 }
 
-// Spin until Gemmini reports not busy
-static inline void gemmini_poll_until_ready() {
-    volatile uint32_t *status = (volatile uint32_t*)(GEMMINI_BUSY_ADDR); // check your offset
-    while (*status & 0x1) {
-        // busy — keep polling
-    }
-}
+#undef gemmini_fence
+#define gemmini_fence() { while (*((volatile uint32_t *) GEMMINI_BUSY_ADDR)) asm volatile ("nop"); }
 
 int main() {
 #ifndef BAREMETAL
@@ -82,8 +80,8 @@ int main() {
   gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
 
   // ---- Load scale factors ----
-  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, 1024);
-  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, 1024);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
 
   // ---- MVIN A: tile (i,k) -> a_base + (i*tiles_K + k)*DIM ----
   gemmini_config_ld(MATMUL_K * sizeof(elem_t));
@@ -140,8 +138,6 @@ int main() {
 
 //  gemmini_mvout((void*)&C_hw[0][0], 128 )
 
-  gemmini_fence();
-  gemmini_poll_until_ready();
   gemmini_fence();
 
   uint64_t* smem_start_addr = ((uint64_t*)SMEM) + SPAD_DEST * 2;

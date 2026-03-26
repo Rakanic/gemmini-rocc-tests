@@ -845,8 +845,8 @@ def run(M: int, K: int, N: int, header_path: str = "matmul_data.h", verbose: boo
 
     Gk = (K + GROUP - 1) // GROUP
     torch.manual_seed(SEED + 123)
-    A_scale_exp = torch.zeros(size=(M, Gk), device=dev)
-    B_scale_exp = torch.zeros(size=(Gk, N), device=dev)
+    A_scale_exp = torch.randint(-3, 4, size=(M, Gk), device=dev).float()
+    B_scale_exp = torch.randint(-3, 4, size=(Gk, N), device=dev).float()
     A_scales_row = torch.pow(2.0, A_scale_exp.to(torch.float32))
     B_scales_col = torch.pow(2.0, B_scale_exp.to(torch.float32))
     A_scales_row_q = make_fp_quantizer(SCALE_SPEC, "nearest")(A_scales_row)
