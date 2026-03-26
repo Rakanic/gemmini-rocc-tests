@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import math
+from pathlib import Path
 import re
 import time
 from typing import Callable, Optional, Dict, Tuple, List
@@ -561,6 +562,27 @@ def c_type_for_bits(total_bits: int) -> str:
     elif total_bits <= 32: return "uint32_t"
     else: return "uint64_t"
 
+def code_matrix_to_bytes(codes: List[List[int]], total_bits: int) -> bytes:
+    if total_bits <= 8:
+        width_bytes = 1
+    elif total_bits <= 16:
+        width_bytes = 2
+    elif total_bits <= 32:
+        width_bytes = 4
+    elif total_bits <= 64:
+        width_bytes = 8
+    else:
+        raise ValueError(f"Unsupported code width: {total_bits} bits")
+
+    buf = bytearray()
+    for row in codes:
+        for code in row:
+            buf.extend(int(code).to_bytes(width_bytes, byteorder="little", signed=False))
+    return bytes(buf)
+
+def write_code_bin(path: str, codes: List[List[int]], total_bits: int) -> None:
+    Path(path).write_bytes(code_matrix_to_bytes(codes, total_bits))
+
 # --- Hardware-matching MAC ---
 
 def prod_quant(x: Tensor) -> Tensor:
@@ -772,6 +794,26 @@ def write_c_header_tiled(
         f.write(f"static const uint16_t C_out_bf16[MATMUL_M][MATMUL_N] = {{\n{fmt(C_hex)}\n}};\n\n")
         f.write(f"#endif // {guard}\n")
 
+def write_tensor_bins(
+    base_dir: str,
+    A_in: Tensor,
+    B_in: Tensor,
+    C_out_quantized: Tensor,
+    C_out_bf16: Tensor,
+):
+    out_dir = Path(base_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    A_codes, A_bits = tensor_to_custom_fp_codes(A_in, INPUT_SPEC)
+    B_codes, B_bits = tensor_to_custom_fp_codes(B_in, INPUT_SPEC)
+    Cq_codes, Cq_bits = tensor_to_custom_fp_codes(C_out_quantized, INPUT_SPEC)
+    C_bf16_codes, C_bf16_bits = tensor_to_custom_fp_codes(C_out_bf16, "bf16")
+
+    write_code_bin(str(out_dir / "A_in.bin"), A_codes, A_bits)
+    write_code_bin(str(out_dir / "B_in.bin"), B_codes, B_bits)
+    write_code_bin(str(out_dir / "C_out_quant.bin"), Cq_codes, Cq_bits)
+    write_code_bin(str(out_dir / "C_out_bf16.bin"), C_bf16_codes, C_bf16_bits)
+
 def array_mx_requantize(array: Tensor, quant_spec: str) -> Tuple[Tensor, float]:
     e_bits, m_bits = parse_fp_spec(quant_spec)
     max_val = array.abs().to(torch.bfloat16).view(torch.int16).max()
@@ -868,7 +910,9 @@ def run(M: int, K: int, N: int, header_path: str = "matmul_data.h", verbose: boo
         C_out_quantized=C_out_quantized,
         C_out_scales=C_out_scales,
     )
+    write_tensor_bins(Path(header_path).resolve().parent, A_in, B_in, C_out_quantized, C_out_bf16)
     print(f"\nHeader written to: {header_path}")
+    print(f"Binary tensors written to: {Path(header_path).resolve().parent}")
 
     return C_out_bf16
 
@@ -895,4 +939,3 @@ if __name__ == "__main__":
     acc_precision_list = [(4,4)] * 8 + [(4,5)] * 2 + [(4,6)] * 5 + [(8,7)] * 1
 
     run(args.M, args.K, args.N, header_path=args.header_path, verbose=not args.quiet, acc_precision_list=acc_precision_list, prod_precision_list=prod_precision_list)
-
