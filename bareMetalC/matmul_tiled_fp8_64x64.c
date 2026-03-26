@@ -165,8 +165,8 @@ int main() {
           uint16_t got_bf16 = (got >> (lane * 16)) & 0xFFFF;
           uint16_t exp_bf16 = C_out_bf16[i][j * BF16_PER_WORD + lane];
           if (got_bf16 != exp_bf16) {
-//            printf("MISMATCH @(%d,%d) HW=0x%04x EXP=0x%04x\n",
-//                   i, j * BF16_PER_WORD + lane, got_bf16, exp_bf16);
+            printf("MISMATCH @(%d,%d) HW=0x%04x EXP=0x%04x\n",
+                   i, j * BF16_PER_WORD + lane, got_bf16, exp_bf16);
             errors++;
           }
         }

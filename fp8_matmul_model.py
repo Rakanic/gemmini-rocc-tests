@@ -199,45 +199,40 @@ def mx_product_saturate(x: Tensor, exp_bits: int, man_bits: int) -> Tensor:
     return sign * torch.where(ax > max_normal, torch.full_like(ax, sat_val), ax)
 
 def mx_product_quantize_trunc(x: Tensor, exp_bits: int, frac_bits: int) -> Tensor:
-    """Match the MxFPMul product path before the accumulator resize.
-    The PE product keeps `frac_bits` fractional bits with truncation, not RNE,
-    and values below the minimum normal are truncated onto the product
-    subnormal grid before `MxPEOutToRaw` hands them to HardFloat."""
+    """
+    Match the MxFPMul product path before the accumulator resize.
+    The PE product keeps `frac_bits` fractional bits with truncation.
+    Because of the corrected MxPEOutToRaw logic, NO subnormal grid is applied
+    at this stage. The fraction remains perfectly normalized with full precision
+    regardless of how small the exponent is.
+    """
     x = x.float()
     out = x.clone()
     finite = torch.isfinite(x)
     ax = x.abs()
     nz = finite & (ax != 0)
-    if not nz.any():
-        return out
 
-    bias = (1 << (exp_bits - 1)) - 1
-    emin = 1 - bias
-    scale = float(1 << frac_bits)
-    quantum = float(2.0 ** (emin - frac_bits))
+    if not nz.any():
+        return mx_product_saturate(out, exp_bits, frac_bits)
 
     ax_nz = ax[nz]
-    val_nz = torch.zeros_like(ax_nz)
+
+    # frexp gives m in [0.5, 1.0) and e such that x = m * 2^e
     m, e = torch.frexp(ax_nz)
     E = e - 1
 
-    normal = E >= emin
-    if normal.any():
-        m_n = m[normal]
-        E_n = E[normal]
-        frac = 2.0 * m_n - 1.0
-        frac_q = torch.floor(frac * scale) / scale
-        val_n = (1.0 + frac_q) * torch.ldexp(torch.ones_like(frac_q), E_n)
-        val_nz[normal] = val_n
+    # The hardware multiplier simply normalizes and truncates to frac_bits.
+    # We apply this universally without checking for 'emin'.
+    scale = float(1 << frac_bits)
+    frac = 2.0 * m - 1.0
+    frac_q = torch.floor(frac * scale) / scale
 
-    subnormal = ~normal
-    if subnormal.any():
-        ax_s = ax_nz[subnormal]
-        k = torch.floor(ax_s / quantum)
-        val_nz[subnormal] = k * quantum
+    # Reconstruct the value
+    val_nz = (1.0 + frac_q) * torch.ldexp(torch.ones_like(frac_q), E)
 
     out[nz] = torch.sign(x[nz]) * val_nz
     out[finite & (ax == 0)] = x[finite & (ax == 0)]
+
     return mx_product_saturate(out, exp_bits, frac_bits)
 
 def _round_div_pow2_rne_int(n: int, shift: int) -> int:
@@ -327,6 +322,45 @@ def _scalar_to_dyadic(x: float) -> Tuple[bool, int, int]:
     num, den = ax.as_integer_ratio()
     exp2 = -(den.bit_length() - 1)
     return (math.copysign(1.0, x) < 0), num, exp2
+
+def _mx_product_quantize_trunc_scalar(x: float, exp_bits: int, man_bits: int) -> float:
+    if math.isnan(x):
+        return float("nan")
+    if x == 0.0:
+        return x
+
+    bias = (1 << (exp_bits - 1)) - 1
+    emin = 1 - bias
+    is_mx_fp8 = (exp_bits == 4 and man_bits == 3)
+    emax = bias + 1 if is_mx_fp8 else bias
+    scale = 1 << man_bits
+    max_mant = (scale - 2) if is_mx_fp8 else (scale - 1)
+    max_normal = (2.0 ** emax) * (1.0 + max_mant / scale)
+    sat_man = scale - 2
+    sat_val = (1.0 + sat_man / scale) * (2.0 ** (bias + 1))
+
+    if math.isinf(x):
+        return -sat_val if math.copysign(1.0, x) < 0 else sat_val
+
+    sign, num, exp2 = _scalar_to_dyadic(x)
+    p = num.bit_length() - 1
+    E = exp2 + p
+
+    if E < emin:
+        shift = (emin - man_bits) - exp2
+        sub_sig = num >> shift if shift >= 0 else num << (-shift)
+        val = math.ldexp(float(sub_sig), emin - man_bits)
+    else:
+        shift = p - man_bits
+        total_sig = num >> shift if shift >= 0 else num << (-shift)
+        if total_sig >= (1 << (man_bits + 1)):
+            total_sig >>= 1
+            E += 1
+        val = math.ldexp(float(total_sig), E - man_bits)
+
+    if val > max_normal:
+        val = sat_val
+    return -val if sign else val
 
 def fp_quantize_rne_scalar(x: float, exp_bits: int, man_bits: int) -> float:
     if math.isnan(x):
@@ -861,3 +895,4 @@ if __name__ == "__main__":
     acc_precision_list = [(4,4)] * 8 + [(4,5)] * 2 + [(4,6)] * 5 + [(8,7)] * 1
 
     run(args.M, args.K, args.N, header_path=args.header_path, verbose=not args.quiet, acc_precision_list=acc_precision_list, prod_precision_list=prod_precision_list)
+
