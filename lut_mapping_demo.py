@@ -14,6 +14,7 @@ So each byte stores two indices:
 """
 
 import sys
+import os
 import random
 from pathlib import Path
 import numpy as np
@@ -61,8 +62,10 @@ from lut_golden_model import (
 #     return result
 
 # ── Parameters (edit to match your run) ───────────────────────────────────────
-SEED           = 0
-M, K, N        = 128, 128, 128
+SEED           = int(os.environ.get("MXGEMMINI_SEED", "0"))
+M              = int(os.environ.get("MXGEMMINI_M", "128"))
+K              = int(os.environ.get("MXGEMMINI_K", "512"))
+N              = int(os.environ.get("MXGEMMINI_N", "128"))
 INPUT_SPEC     = "fp6:e3m2"
 LUT_INDEX_BITS = 4          # 2^4 = 16-entry LUT
 DEV            = torch.device("cpu")
@@ -576,8 +579,9 @@ for m in range(min(64, M)):
     print(f"  row {m:3d}: " + " | ".join(groups))
 
 print("\n[Step 9]: Write header with C_lut, C_proj indices, and C scales")
+HEADER_PATH = os.environ.get("MXGEMMINI_HEADER_PATH", "./include/matmul_data_mx_lut_hw.h")
 write_c_header_tiled_hw(
-    path           = "./include/matmul_data_mx_lut_hw.h",
+    path           = HEADER_PATH,
     M=M, K=K, N=N,
     group          = GROUP,
     input_spec     = INPUT_SPEC,
@@ -597,10 +601,9 @@ write_c_header_tiled_hw(
     a_tile_m       = A_TILE_M,
     k_tile         = K_TILE,
 )
-print("Header written to ./include/matmul_data_mx_lut_hw.h")
+print(f"Header written to {HEADER_PATH}")
 
 # Append C_proj in A_in HW layout [M//2, N] to the header
-HEADER_PATH = "./include/matmul_data_mx_lut_hw.h"
 with open(HEADER_PATH, "r") as f:
     content = f.read()
 # Remove existing #endif, append C_proj_hw array, then re-close with #endif
@@ -622,5 +625,6 @@ with open(HEADER_PATH, "w") as f:
     f.write(content)
 print("C_proj_hw appended to header.")
 
-write_tensor_bins(Path.cwd(), A_indices, B_indices, C_proj_hw, C_out_bf16)
-print(f"Binary tensors written to {Path.cwd()}")
+BIN_DIR = Path(os.environ.get("MXGEMMINI_BIN_DIR", str(Path.cwd())))
+write_tensor_bins(BIN_DIR, A_indices, B_indices, C_proj_hw, C_out_bf16)
+print(f"Binary tensors written to {BIN_DIR}")
