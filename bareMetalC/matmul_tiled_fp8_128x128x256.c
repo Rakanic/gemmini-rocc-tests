@@ -107,9 +107,9 @@ int main() {
     }
   }
 
-  int SPAD_DEST = 256;
+  int SPAD_DEST = 0;
 
-  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  gemmini_config_st(DIM * sizeof(elem_t));
   gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
 
   // ---- Compute ----
@@ -140,15 +140,18 @@ int main() {
 
   gemmini_fence();
 
-  uint64_t* smem_start_addr = ((uint64_t*)SMEM) + SPAD_DEST * 2;
-  printf("Address: %p \n", smem_start_addr);
-  for (int i = 0; i < MATMUL_M; i ++) {
-    for (int j = 0; j < OUT_COLS; j++) {
-//       printf("addr: %p \n", smem_start_addr + (i*8 + j) );
-//       printf("Elem: %d = %lx \n", i * MATMUL_M + j, *(smem_start_addr + (i*OUT_COLS + j)));
-        C_hw[i][j] = *(smem_start_addr + (i*OUT_COLS + j));
-    }
+//  uint64_t* smem_addr = ((uint64_t*)SMEM) + SPAD_DEST * 2 + 448 / 8;
+//  printf("SMEM at address %x = %lx \n", ((uint64_t*)SMEM), *((uint64_t*)SMEM));
+//  printf("SMEM at address %x = %lx \n", smem_addr, *smem_addr);
+//  printf("SMEM at address %x = %lx \n", smem_addr + 2, *(smem_addr+2));
+
+
+  printf("Moving out:\n");
+//  gemmini_mvout((void*)((uint64_t*) C_hw), SPAD_DEST);
+  for (int i = 0; i < tiles_J*tiles_I*2; i++) {
+      gemmini_mvout((void*)((uint64_t*) C_hw + i*2*DIM), SPAD_DEST + i*DIM);
   }
+  gemmini_fence();
 
   // ---- Debug print tile (0,0) ----
 //  printf("=== Tile (0,0) - acc_addr=0x%08x ===\n", acc_addr);
