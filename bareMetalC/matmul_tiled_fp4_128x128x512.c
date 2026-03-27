@@ -65,6 +65,7 @@ static inline int popcount8(uint8_t x) {
 
 
 int main() {
+  printf("cout: %x\n", C_out_bf16[10][36]);
 #ifndef BAREMETAL
   if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
     perror("mlockall");
