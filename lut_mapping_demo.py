@@ -22,15 +22,13 @@ import torch
 sys.path.insert(0, ".")
 # from fp_decoder import ieee_to_recfn
 from fp_decoder import recfn_to_ieee
-import lut_fp8_matmul_model
-from lut_fp8_matmul_model import matmul_outer_quantized_hwlike, compute_tile_scale_matrix, tiled_matmul_hwlike
+import fp8_matmul_model
+from fp8_matmul_model import matmul_outer_quantized_hwlike, compute_tile_scale_matrix, tiled_matmul_hwlike, matrix_mx_requantize, tensor_to_custom_fp_codes, make_fp_quantizer
 from lut_golden_model import (
     make_lut,
     quantize_lut_indices,
     lut_lookup,
-    tensor_to_custom_fp_codes,
     codes_to_hex_rows,
-    make_fp_quantizer,
     tiled_matmul_scaled_accum_hwlike,
     q_bf16_rne,
     hw_add_bf16,
@@ -39,6 +37,7 @@ from lut_golden_model import (
     write_c_header_tiled_hw,
     compute_tile_scale_matrix_fpe8m0,
     _a_indices_to_hw_layout,
+
 )
 
 # def bf16_tensor_to_recfn_hex(t: torch.Tensor) -> list:
@@ -232,7 +231,6 @@ k_group_idx = torch.arange(K, device=DEV) // GROUP                       # (K,)
 A_fp_scaled = A_fp * A_scales_row_q[:, k_group_idx]                      # (M, K)
 B_fp_scaled = B_fp * B_scales_col_q[k_group_idx, :]                      # (K, N)
 
-lut_fp8_matmul_model.prod_quant = make_fp_quantizer(INPUT_SPEC, "nearest")
 C_out = matmul_outer_quantized_hwlike(A_fp_scaled, B_fp_scaled)
 
 for k_base in range(0, K, K_TILE):
@@ -425,17 +423,22 @@ for k_base in range(0, K, K_TILE):
 
 
 print("[Step 5]: Compare C_out with tiled_matmul_hwlike golden")
-# print(lut_fp8_matmul_model.TILE)  # should be 16 = K_TILE
-# print(lut_fp8_matmul_model.GROUP) # should be 32 = GROUP
+# print(fp8_matmul_model.TILE)  # should be 16 = K_TILE
+# print(fp8_matmul_model.GROUP) # should be 32 = GROUP
 # exit()
-lut_fp8_matmul_model.prod_quant = lambda x: x   # no fp6 prod quant — matches hardware
+prod_precision_list = [(4, 3)] * TILE
+acc_precision_list  = [(4, 4)] * 8 + [(4, 5)] * 2 + [(4, 6)] * 5 + [(8, 7)] * 1
+in_q = make_fp_quantizer(INPUT_SPEC, rounding="zero")
+A_in = in_q(A_fp)
+B_in = in_q(B_fp)
 C_golden = tiled_matmul_hwlike(
-    A_fp, B_fp,
+    A_in, B_in,
     A_scales_row_q, B_scales_col_q,
     verbose=False,
+    prod_precision_list=prod_precision_list,
+    acc_precision_list=acc_precision_list,
 )
-C_out_bf16   = q_bf16_rne(C_out)
-C_golden_bf16 = q_bf16_rne(C_golden)
+C_golden_bf16 = C_golden
 C_golden_r = C_golden_bf16[:DEBUG_R, :DEBUG_R]
 C_golden_r_codes, C_golden_r_bits = tensor_to_custom_fp_codes(C_golden_r, "bf16")
 # print(f"\n--- C_golden[:{DEBUG_R},:{DEBUG_R}] (bf16 hex) ---")
@@ -450,33 +453,26 @@ C_golden_r_codes, C_golden_r_bits = tensor_to_custom_fp_codes(C_golden_r, "bf16"
 #     print(f"Largest diff at ({m},{n}): demo={C_out_bf16[m,n].item():.6f}  golden={C_golden_bf16[m,n].item():.6f}")
 
 print("[Step 6]: Write C header with HW data layout")
-C_out_bf16 = q_bf16_rne(C_golden)
-# write_c_header_tiled_hw(
-#     path           = "./include/matmul_data_mx_lut_hw.h",
-#     M=M, K=K, N=N,
-#     group          = GROUP,
-#     input_spec     = INPUT_SPEC,
-#     acc_spec       = "bf16",
-#     scale_spec     = SCALE_SPEC,
-#     lut_index_bits = LUT_INDEX_BITS,
-#     A_in           = A_indices,       # [M, K]  — raw LUT indices
-#     B_in           = B_indices,       # [K, N]  — raw LUT indices
-#     A_scales_row_q = A_scales_row_q,  # [M, Gk]
-#     B_scales_col_q = B_scales_col_q,  # [Gk, N]
-#     C_out_bf16     = C_out_bf16,      # [M, N]
-#     A_lut          = A_luts_t,        # [M, LUT_SIZE] per-row LUTs
-#     B_lut          = B_luts_t,        # [N, LUT_SIZE] per-col LUTs
-#     a_tile_m       = A_TILE_M,
-#     k_tile         = K_TILE,
-# )
-print("Header written to matmul_data_mx_lut_hw.h")
+C_out_bf16 = C_golden
 
-print("\n[Step 7]: Requantize C_golden_bf16 via matrix_mx_requantize")
-from lut_fp8_matmul_model import matrix_mx_requantize
+print("\n[Step 7]: Requantize C_out_bf16 via matrix_mx_requantize")
 C_requantized, C_req_scales = matrix_mx_requantize(
-        C_golden_bf16,
+        C_out_bf16,
         quant_spec=INPUT_SPEC)
 print(f"  quant_spec: {INPUT_SPEC}  scale_spec: {SCALE_SPEC}")
+
+# Flush fp6 subnormals to zero (hardware FTZ behavior)
+# Subnormals have exp=0, mant!=0; smallest normal = 2^(1 - bias) = 2^(1-3) = 0.25 for e3m2
+_e, _m = parse_fp_spec(INPUT_SPEC)
+_bias = (1 << (_e - 1)) - 1
+_fp6_smallest_normal = 2.0 ** (1 - _bias)
+C_requantized = torch.where(
+    (C_requantized.abs() < _fp6_smallest_normal) & (C_requantized != 0),
+    torch.zeros_like(C_requantized),
+    C_requantized,
+)
+print(f"  FTZ: flushed subnormals (|x| < {_fp6_smallest_normal}) to zero")
+
 # print(f"  C_requantized shape: {list(C_requantized.shape)}  C_req_scales shape: {list(C_req_scales.shape)}")
 # req_codes, req_bits = tensor_to_custom_fp_codes(C_requantized, INPUT_SPEC)
 # print(f"\n--- C_requantized (all {M}x{N}, {INPUT_SPEC} hex) ---")
@@ -488,11 +484,11 @@ scale_codes, scale_bits = tensor_to_custom_fp_codes(C_req_scales, SCALE_SPEC)
 #     print(f"  row {i:3d}: {row}")
 
 # Per-row, per-group breakdown (first 2 rows only)
-Gk_out = C_golden_bf16.shape[1] // GROUP
+Gk_out = C_out_bf16.shape[1] // GROUP
 print(f"\n--- C per-row group breakdown (group_size={GROUP}, Gk={Gk_out}, showing first 2 rows) ---")
-for m in range(min(2, C_golden_bf16.shape[0])):
+for m in range(min(2, C_out_bf16.shape[0])):
     print(f"  row {m:3d}:")
-    bf16_row = C_golden_bf16[m]
+    bf16_row = C_out_bf16[m]
     for g in range(1):
         col_start = g * GROUP
         col_end   = col_start + GROUP
