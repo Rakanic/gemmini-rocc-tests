@@ -64,7 +64,7 @@ from lut_golden_model import (
 # ── Parameters (edit to match your run) ───────────────────────────────────────
 SEED           = int(os.environ.get("MXGEMMINI_SEED", "0"))
 M              = int(os.environ.get("MXGEMMINI_M", "128"))
-K              = int(os.environ.get("MXGEMMINI_K", "128"))
+K              = int(os.environ.get("MXGEMMINI_K", "512"))
 N              = int(os.environ.get("MXGEMMINI_N", "128"))
 INPUT_SPEC     = "fp6:e3m2"
 LUT_INDEX_BITS = 4          # 2^4 = 16-entry LUT
@@ -739,7 +739,7 @@ for m in range(M // 2):
     print(f"  row {m:3d}: " + " | ".join(groups))
 
 print("\n[Step 9]: Write header with C_lut, C_proj indices, and C scales")
-HEADER_PATH = os.environ.get("MXGEMMINI_HEADER_PATH", "./include/matmul_data_mx_lut_hw.h")
+HEADER_PATH = os.environ.get("MXGEMMINI_HEADER_PATH", "./include/matmul_fp6_128x128x512.h")
 write_c_header_tiled_hw(
     path           = HEADER_PATH,
     M=M, K=K, N=N,
