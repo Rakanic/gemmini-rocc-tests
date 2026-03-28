@@ -62,7 +62,7 @@ from lut_golden_model import (
 
 # ── Parameters (edit to match your run) ───────────────────────────────────────
 SEED           = 0
-M, K, N        = 128, 128, 128
+M, K, N        = 128, 512, 128
 INPUT_SPEC     = "fp6:e3m2"
 LUT_INDEX_BITS = 4          # 2^4 = 16-entry LUT
 DEV            = torch.device("cpu")
@@ -552,32 +552,32 @@ for mg in range(min(NUM_PRINT_MGRP, M >> G)):
         lut_looked_up= [f"{C_luts_t[mg, indices[i]].item():.4f}" for i in range(NUM_PRINT_COLS)]
         print(f"    row {m:3d}: fp6={fp6_hex}  ->  idx={indices}  ->  lut_val={lut_looked_up}")
 
-print("\n--- C_req_codes_raw first 32 rows (fp6 codes, hex) ---")
-for m in range(min(128, M)):
+print(f"\n--- C_req_codes_raw all {M} rows (fp6 codes, hex) ---")
+for m in range(M):
     groups = [" ".join(f"{C_req_codes_raw[m][n]:02x}" for n in range(g, min(g + 32, N)))
               for g in range(0, N, 32)]
     print(f"  row {m:3d}: " + " | ".join(groups))
 
-print("\n--- C_golden_bf16 first 32 rows (bf16 hex) ---")
-for m in range(min(128, M)):
+print(f"\n--- C_golden_bf16 all {M} rows (bf16 hex) ---")
+for m in range(M):
     groups = [" ".join(f"{C_golden_bf16[m, n].to(torch.bfloat16).view(torch.int16).item() & 0xFFFF:04x}"
                        for n in range(g, min(g + 32, N)))
               for g in range(0, N, 32)]
     print(f"  row {m:3d}: " + " | ".join(groups))
 
-print("\n--- C_proj A_in HW layout [M//2, N] (bits[3:0]=even row, bits[7:4]=odd row per col) ---")
+print(f"\n--- C_proj A_in HW layout [{M // 2}][{N}] (bits[3:0]=even row, bits[7:4]=odd row per col) ---")
 C_proj_hw = _a_indices_to_hw_layout(C_proj, a_tile_m=A_TILE_M, k_tile=K_TILE)  # [M//2, N]
 # for r in range(M // 2):
 #     hw_hex = " ".join(f"{C_proj_hw[r][n]:02x}" for n in range(N))
 #     print(f"  hw row {r:3d}: {hw_hex}")
-for m in range(min(64, M)):
+for m in range(M // 2):
     groups = [" ".join(f"{C_proj_hw[m][n]:02x}" for n in range(g, min(g + 32, N)))
               for g in range(0, N, 32)]
     print(f"  row {m:3d}: " + " | ".join(groups))
 
 print("\n[Step 9]: Write header with C_lut, C_proj indices, and C scales")
 write_c_header_tiled_hw(
-    path           = "./include/matmul_data_mx_lut_hw.h",
+    path           = "./include/matmul_fp6_128x128x512.h",
     M=M, K=K, N=N,
     group          = GROUP,
     input_spec     = INPUT_SPEC,
@@ -624,3 +624,4 @@ print("C_proj_hw appended to header.")
 
 write_tensor_bins(Path.cwd(), A_indices, B_indices, C_proj_hw, C_out_bf16)
 print(f"Binary tensors written to {Path.cwd()}")
+
