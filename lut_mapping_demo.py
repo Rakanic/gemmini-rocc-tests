@@ -64,7 +64,7 @@ from lut_golden_model import (
 # ── Parameters (edit to match your run) ───────────────────────────────────────
 SEED           = int(os.environ.get("MXGEMMINI_SEED", "0"))
 M              = int(os.environ.get("MXGEMMINI_M", "128"))
-K              = int(os.environ.get("MXGEMMINI_K", "512"))
+K              = int(os.environ.get("MXGEMMINI_K", "128"))
 N              = int(os.environ.get("MXGEMMINI_N", "128"))
 INPUT_SPEC     = "fp6:e3m2"
 LUT_INDEX_BITS = 4          # 2^4 = 16-entry LUT
@@ -77,6 +77,172 @@ QUANT_LUT_UPDATE_GRANULARITY = 1  # every 2^g rows of A / cols of B share one LU
 Gk             = K // GROUP
 DEBUG_R        = 4             # print first DEBUG_R x DEBUG_R elements in debug blocks
 # ──────────────────────────────────────────────────────────────────────────────
+
+import math as _math
+
+# ── Hardware-accurate BF16 → fp6:e3m2 conversion ─────────────────────────────
+# Matches the RTL pipeline in BF16ScaleRoundToTiny.scala:
+#   1) roundToMx: HardFloat RoundAnyRawFNToRecFN(8,8,4,3) RNE → E4M2
+#   2) E4M2ToFp6: deterministic re-encoding to fp6:e3m2
+
+def _bf16_to_e4m2_rne(x: torch.Tensor) -> torch.Tensor:
+    """Round BF16 tensor to E4M2 (1+4+2, bias=7) using RNE.
+
+    Bit-accurate match to HardFloat RoundAnyRawFNToRecFN(8,8,4,3,options=0)
+    with round_near_even / tininess_afterRounding.
+
+    E4M2: emin=-6, emax=7, sig=3 (1 hidden + 2 mantissa).
+    """
+    bf16 = x.to(torch.bfloat16)
+    bits = bf16.view(torch.int16).to(torch.int32) & 0xFFFF
+
+    sign_bit = (bits >> 15) & 1
+    E = (bits >> 7) & 0xFF          # 8-bit biased BF16 exponent
+    M = bits & 0x7F                  # 7-bit BF16 fractional mantissa
+
+    sign_f = torch.where(sign_bit == 0, torch.ones_like(x), -torch.ones_like(x))
+    e = E - 127                      # unbiased exponent (valid for normal BF16)
+
+    # ── Normal BF16 → E4M2 normal (e ∈ [-6, 7]) ─────────────────────────────
+    # 8-bit significand S = 128 + M.  Round to 3-bit (drop bottom 5):
+    #   kept = {1, M[6], M[5]}   round = M[4]   sticky = M[3:0]!=0
+    q       = (M >> 5) & 3                       # top 2 mantissa bits
+    r       = ((M >> 4) & 1).bool()               # round bit
+    sticky  = (M & 0xF).ne(0)                    # sticky bit
+    lsb     = ((M >> 5) & 1).bool()               # LSB of kept bits
+
+    round_up = r & (sticky | lsb)                 # RNE tie-breaking
+
+    sig_rounded = q + round_up.to(torch.int32)    # 0..4
+    carry = sig_rounded >= 4
+    mant_out = torch.where(carry, torch.zeros_like(sig_rounded), sig_rounded)
+    exp_out  = torch.where(carry, e + 1, e)       # unbiased E4M2 exponent
+
+    is_overflow = exp_out > 7
+    safe_exp = exp_out.float().clamp(-10, 10)
+    val_normal = sign_f * (1.0 + mant_out.float() * 0.25) * torch.pow(
+        torch.full_like(x, 2.0), safe_exp)
+    val_normal = torch.where(is_overflow, sign_f * float('inf'), val_normal)
+
+    # ── Below E4M2 emin: subnormal region ────────────────────────────────────
+    # E4M2 subnormal quantum = 2^(emin - man) = 2^(-6 - 2) = 2^(-8)
+    quantum = 2.0 ** -8
+
+    # e = -7: BF16 ∈ [2^-7, 2^-6).  v/quantum = (128+M)/64 ∈ [2.0, ~3.98]
+    is_e_neg7 = (e == -7) & (E >= 1)
+    k7 = torch.where(M <= 32, torch.full_like(M, 2),         # ≤2.5 → 2 (even)
+         torch.where(M <= 95, torch.full_like(M, 3),         # <3.5 → 3
+                              torch.full_like(M, 4)))         # ≥3.5 → 4 (even, = norm)
+    val_e7 = sign_f * k7.float() * quantum
+
+    # e = -8: BF16 ∈ [2^-8, 2^-7).  v/quantum = (128+M)/128 ∈ [1.0, ~1.99]
+    is_e_neg8 = (e == -8) & (E >= 1)
+    k8 = torch.where(M < 64, torch.ones_like(M),             # <1.5 → 1
+                              torch.full_like(M, 2))          # ≥1.5 → 2 (even)
+    val_e8 = sign_f * k8.float() * quantum
+
+    # e = -9: BF16 ∈ [2^-9, 2^-8).  v/quantum = (128+M)/256 ∈ [0.5, ~1.0)
+    is_e_neg9 = (e == -9) & (E >= 1)
+    k9 = torch.where(M == 0, torch.zeros_like(M),            # 0.5 tie → 0 (even)
+                              torch.ones_like(M))             # >0.5 → 1
+    val_e9 = sign_f * k9.float() * quantum
+
+    # ── Assemble ─────────────────────────────────────────────────────────────
+    result = val_normal
+    result = torch.where(is_e_neg7, val_e7, result)
+    result = torch.where(is_e_neg8, val_e8, result)
+    result = torch.where(is_e_neg9, val_e9, result)
+    result = torch.where(((e <= -10) & (E >= 1)) | (E == 0),
+                         torch.zeros_like(x), result)
+
+    # BF16 Inf / NaN → E4M2 Inf / NaN
+    is_nan = (E == 255) & (M != 0)
+    is_inf = (E == 255) & (M == 0)
+    result = torch.where(is_inf, sign_f * float('inf'), result)
+    result = torch.where(is_nan, torch.full_like(x, float('nan')), result)
+
+    return result
+
+
+def _e4m2_to_fp6(x: torch.Tensor) -> torch.Tensor:
+    """Deterministic E4M2 → fp6:e3m2 mapping, matching E4M2ToFp6 hardware.
+
+    E4M2 (bias=7) → fp6:e3m2 (bias=3), biasDiff=4.
+      biased exp ≤ 2  → fp6 zero
+      biased exp 3,4  → fp6 subnormal (hardware MuxLookup)
+      biased exp 5–11 → fp6 normal (exp_adj = exp − 4, mantissa unchanged)
+      biased exp > 11 → fp6 max (28.0); also Inf/NaN → max
+    """
+    sign = x.sign()
+    ax   = x.abs()
+
+    # mapToZero: E4M2 biased exp ≤ 2 → largest is 1.75*2^(-5) = 0.0546875
+    mapToZero = (ax <= 0.0546875)
+
+    # mapToMax: E4M2 biased exp > 11 → smallest is 2^5 = 32.0, or Inf/NaN
+    mapToMax = (ax >= 32.0) | ~torch.isfinite(ax)
+
+    # mapToSubnorm: E4M2 biased exp 3 (values 0.0625..0.109375)
+    #               or biased exp 4 (values 0.125..0.21875)
+    # Hardware lookup per (exp, sig) pair:
+    #   exp3 sig=0,1 → k=1 (0.0625)   exp3 sig=2,3 → k=2 (0.125)
+    #   exp4 sig=0,1 → k=2 (0.125)    exp4 sig=2,3 → k=3 (0.1875)
+    mapToSubnorm = (ax >= 0.0625) & (ax <= 0.21875)
+    sub_val = torch.where(ax <= 0.078125,  torch.full_like(ax, 0.0625),
+              torch.where(ax <= 0.15625,   torch.full_like(ax, 0.125),
+                                           torch.full_like(ax, 0.1875)))
+
+    # fp6 max = 1.75 * 2^4 = 28.0
+    out = x.clone()
+    out = torch.where(mapToZero,    torch.zeros_like(x), out)
+    out = torch.where(mapToMax,     sign * 28.0,         out)
+    out = torch.where(mapToSubnorm, sign * sub_val,      out)
+    # Normal range: float value is unchanged (same mantissa bits, exponent rebased)
+    return out
+
+
+def hw_bf16_to_fp6(x: torch.Tensor) -> torch.Tensor:
+    """Hardware-accurate BF16 → fp6:e3m2, matching BF16ScaleRoundToTiny (fp6 path).
+
+    1. RNE round BF16 bit-pattern to E4M2 (hardfloat RoundAnyRawFNToRecFN(8,8,4,3)).
+    2. Deterministic E4M2→fp6 re-encoding (E4M2ToFp6.scala).
+    """
+    return _e4m2_to_fp6(_bf16_to_e4m2_rne(x))
+
+
+def _fp6_value_to_code(v: float) -> int:
+    """Encode a single fp6:e3m2 grid value to its 6-bit code (handles subnormals)."""
+    if v == 0.0:
+        return 0
+    s = 1 if v < 0 else 0
+    av = abs(v)
+    e_bits, m_bits, bias = 3, 2, 3
+    emin = 1 - bias   # -2
+    if av < 2.0 ** emin:          # subnormal: value = mant * 2^(emin - m_bits)
+        quantum = 2.0 ** (emin - m_bits)   # 0.0625
+        mant = int(round(av / quantum))
+        return (s << (e_bits + m_bits)) | max(0, min(mant, (1 << m_bits) - 1))
+    # normal
+    E = int(_math.floor(_math.log2(av)))
+    base = 2.0 ** E
+    mant = int(round((av - base) / (base / 4)))
+    if mant >= 4:
+        mant = 0
+        E += 1
+    biased_exp = min(E + bias, (1 << e_bits) - 1)
+    mant = min(mant, (1 << m_bits) - 1)
+    return (s << (e_bits + m_bits)) | (biased_exp << m_bits) | mant
+
+
+def _fp6_tensor_to_codes(t: torch.Tensor) -> list:
+    """Encode a 2-D float tensor (already on fp6:e3m2 grid) to nested list of 6-bit codes."""
+    arr = t.detach().cpu()
+    if arr.ndim == 1:
+        arr = arr.unsqueeze(0)
+    rows, cols = arr.shape
+    return [[_fp6_value_to_code(float(arr[r, c].item())) for c in range(cols)]
+            for r in range(rows)]
+
 
 def _tensor_u8_bytes(t) -> bytes:
     arr = torch.as_tensor(t, dtype=torch.uint8).contiguous().cpu().numpy()
@@ -464,17 +630,11 @@ C_requantized, C_req_scales = matrix_mx_requantize(
         quant_spec=INPUT_SPEC)
 print(f"  quant_spec: {INPUT_SPEC}  scale_spec: {SCALE_SPEC}")
 
-# Flush fp6 subnormals to zero (hardware FTZ behavior)
-# Subnormals have exp=0, mant!=0; smallest normal = 2^(1 - bias) = 2^(1-3) = 0.25 for e3m2
-_e, _m = parse_fp_spec(INPUT_SPEC)
-_bias = (1 << (_e - 1)) - 1
-_fp6_smallest_normal = 2.0 ** (1 - _bias)
-C_requantized = torch.where(
-    (C_requantized.abs() < _fp6_smallest_normal) & (C_requantized != 0),
-    torch.zeros_like(C_requantized),
-    C_requantized,
-)
-print(f"  FTZ: flushed subnormals (|x| < {_fp6_smallest_normal}) to zero")
+# Hardware-accurate BF16 → fp6 conversion (matches BF16ScaleRoundToTiny + E4M2ToFp6)
+# The division by scale already happened in matrix_mx_requantize; snap to BF16 grid
+# then apply the two-stage HW pipeline: RNE→E4M2, E4M2→fp6.
+C_requantized = hw_bf16_to_fp6(q_bf16_rne(C_requantized))
+print(f"  Applied hw_bf16_to_fp6 (BF16 → E4M2 RNE → fp6:e3m2)")
 
 # print(f"  C_requantized shape: {list(C_requantized.shape)}  C_req_scales shape: {list(C_req_scales.shape)}")
 # req_codes, req_bits = tensor_to_custom_fp_codes(C_requantized, INPUT_SPEC)
@@ -520,9 +680,9 @@ print("\n[Step 8]: project the quantized fp6 down to INT4 using C_luts")
 C_luts_t = torch.stack(C_luts)                                        # (M>>G, LUT_SIZE)
 C_luts_codes_raw, _ = tensor_to_custom_fp_codes(C_luts_t, INPUT_SPEC) # list[list[int]], 6-bit
 
-# Convert quantized C float values to 6-bit FP6 codes
-C_req_codes_raw, C_req_bits = tensor_to_custom_fp_codes(
-    C_requantized.float().view(M, N), INPUT_SPEC)                      # list[list[int]]
+# Convert quantized C float values to 6-bit FP6 codes (subnormal-aware encoder)
+C_req_codes_raw = _fp6_tensor_to_codes(C_requantized.float().view(M, N))
+C_req_bits = 6
 
 # For element (m, n): LUT = C_luts[m >> G]  (M-dim row grouping, same as A_luts)
 # Find nearest LUT entry via fp6e3m2_nearest_finder and store 4-bit index
@@ -628,3 +788,4 @@ print("C_proj_hw appended to header.")
 BIN_DIR = Path(os.environ.get("MXGEMMINI_BIN_DIR", str(Path.cwd())))
 write_tensor_bins(BIN_DIR, A_indices, B_indices, C_proj_hw, C_out_bf16)
 print(f"Binary tensors written to {BIN_DIR}")
+
