@@ -279,6 +279,27 @@ def c_type_for_bits(total_bits: int) -> str:
     elif total_bits <= 32: return "uint32_t"
     else:                  return "uint64_t"
 
+def code_matrix_to_bytes(codes: List[List[int]], total_bits: int) -> bytes:
+    if total_bits <= 8:
+        width_bytes = 1
+    elif total_bits <= 16:
+        width_bytes = 2
+    elif total_bits <= 32:
+        width_bytes = 4
+    elif total_bits <= 64:
+        width_bytes = 8
+    else:
+        raise ValueError(f"Unsupported code width: {total_bits} bits")
+
+    buf = bytearray()
+    for row in codes:
+        for code in row:
+            buf.extend(int(code).to_bytes(width_bytes, byteorder="little", signed=False))
+    return bytes(buf)
+
+def write_code_bin(path: str, codes: List[List[int]], total_bits: int) -> None:
+    Path(path).write_bytes(code_matrix_to_bytes(codes, total_bits))
+
 # ── Hardware-matching MAC ──────────────────────────────────────────────────────
 # PROD_MANT_BITS=3 for FP4 E2M1: 1.m × 1.m gives at most 3 fractional bits
 # after normalization to [1,2). Compare FP8 E4M3: 1.mmm × 1.mmm → 7 bits.
@@ -918,6 +939,26 @@ def write_c_header_fp4_direct(
         f.write(f"static const uint16_t C_out_bf16[{M}][{N}] = {{\n{fmt2d(C_hex)}\n}};\n\n")
         f.write(f"#endif // {guard}\n")
 
+def write_tensor_bins(
+    base_dir: str,
+    A_in: Tensor,
+    B_in: Tensor,
+    C_out_quantized: Tensor,
+    C_out_bf16: Tensor,
+):
+    out_dir = Path(base_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    A_codes, A_bits = tensor_to_custom_fp_codes(A_in, INPUT_SPEC)
+    B_codes, B_bits = tensor_to_custom_fp_codes(B_in, INPUT_SPEC)
+    Cq_codes, Cq_bits = tensor_to_custom_fp_codes(C_out_quantized, INPUT_SPEC)
+    C_bf16_codes, C_bf16_bits = tensor_to_custom_fp_codes(C_out_bf16, "bf16")
+
+    write_code_bin(str(out_dir / "A_in.bin"), A_codes, A_bits)
+    write_code_bin(str(out_dir / "B_in.bin"), B_codes, B_bits)
+    write_code_bin(str(out_dir / "C_out_quant.bin"), Cq_codes, Cq_bits)
+    write_code_bin(str(out_dir / "C_out_bf16.bin"), C_bf16_codes, C_bf16_bits)
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def run(M: int, K: int, N: int, header_path: str = "matmul_data_fp4.h", verbose: bool = True,
@@ -976,7 +1017,9 @@ def run(M: int, K: int, N: int, header_path: str = "matmul_data_fp4.h", verbose:
         a_tile_m       = TILE_M,
         k_tile         = TILE_K,
     )
+    write_tensor_bins(Path(header_path).resolve().parent, A_in, B_in, C_out_quantized, C_out_bf16)
     print(f"\nHeader written to: {header_path}")
+    print(f"Binary tensors written to: {Path(header_path).resolve().parent}")
 
     return C_out_bf16
 
@@ -1032,4 +1075,3 @@ if __name__ == "__main__":
                   f"    scale={scale_val:.6g} (e8m0=0x{scale_hex})\n"
                   f"    golden_bf16=[{golden_hex}]\n"
                   f"    quantized={q_hex}")
-
