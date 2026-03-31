@@ -955,9 +955,14 @@ def write_tensor_bins(
     Cq_codes, Cq_bits = tensor_to_custom_fp_codes(C_out_quantized, INPUT_SPEC)
     C_bf16_codes, C_bf16_bits = tensor_to_custom_fp_codes(C_out_bf16, "bf16")
 
-    write_code_bin(str(out_dir / "A_in.bin"), A_codes, A_bits)
-    write_code_bin(str(out_dir / "B_in.bin"), B_codes, B_bits)
-    write_code_bin(str(out_dir / "C_out_quant.bin"), Cq_codes, Cq_bits)
+    A_hw_codes = _a_indices_to_hw_layout(A_codes, TILE_M, TILE_K)
+    B_packed = [[(B_codes[k][n + 1] << 4) | B_codes[k][n] for n in range(0, B_in.shape[1], 2)]
+                for k in range(B_in.shape[0])]
+    Cq_packed = _a_indices_to_hw_layout(Cq_codes, TILE_M, TILE_K)
+
+    write_code_bin(str(out_dir / "A_in.bin"), A_hw_codes, 8)
+    write_code_bin(str(out_dir / "B_in.bin"), B_packed, 8)
+    write_code_bin(str(out_dir / "C_out_quant.bin"), Cq_packed, 8)
     write_code_bin(str(out_dir / "C_out_bf16.bin"), C_bf16_codes, C_bf16_bits)
 
 # ── Entry point ────────────────────────────────────────────────────────────────
