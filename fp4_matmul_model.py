@@ -17,7 +17,7 @@ import torch
 
 sys.path.insert(0, ".")
 
-from golden_model import _a_indices_to_hw_layout  # only used for HW header packing
+from lut_golden_model import _a_indices_to_hw_layout  # only used for HW header packing
 
 Tensor = torch.Tensor
 
