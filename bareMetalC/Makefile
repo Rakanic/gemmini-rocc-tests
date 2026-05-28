@@ -82,6 +82,7 @@ tests = \
 tests_baremetal = $(tests:=-baremetal)
 
 ifeq ($(findstring spike,$(RUNNER)),spike)
+CFLAGS := $(CFLAGS) -DSPIKE_SIM
 # Currently don't support conv or conv-with-pool on spike
 runs_baremetal = $(addsuffix .run,$(filter-out conv-baremetal conv_with_pool-baremetal,$(tests_baremetal)))
 else

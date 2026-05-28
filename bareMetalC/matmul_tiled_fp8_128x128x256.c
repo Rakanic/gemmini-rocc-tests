@@ -23,12 +23,14 @@
 #define GEMMINI_INST_ADDR (GEMMINI_CTRL + 0x0)
 #define GEMMINI_BUSY_ADDR (GEMMINI_CTRL + 0x20)
 
+#ifndef SPIKE_SIM
 #undef ROCC_INSTRUCTION_RS1_RS2
 #define ROCC_INSTRUCTION_RS1_RS2(x, rs1, rs2, funct) { \
     *((volatile uint64_t *) GEMMINI_RS1_ADDR) = (rs1); \
     *((volatile uint64_t *) GEMMINI_RS2_ADDR) = (rs2); \
     *((volatile uint32_t*) GEMMINI_INST_ADDR) = (0x7B) | (0 << 7) | (3 << 12) | (1 << 15) | (2 << 20) | ((funct) << 25); \
 }
+#endif
 
 #define ADDR_LEN 32
 
@@ -50,8 +52,10 @@ void load_scale_factors(volatile uint64_t *sf_mem, uint8_t *scale_factors, int I
   }
 }
 
+#ifndef SPIKE_SIM
 #undef gemmini_fence
 #define gemmini_fence() { while (*((volatile uint32_t *) GEMMINI_BUSY_ADDR)) asm volatile ("nop"); }
+#endif
 
 int main() {
 #ifndef BAREMETAL
@@ -79,9 +83,13 @@ int main() {
   gemmini_flush(0);
   gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
 
-  // ---- Load scale factors ----
+#ifdef SPIKE_SIM
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+#else
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
+#endif
 
   // ---- MVIN A: tile (i,k) -> a_base + (i*tiles_K + k)*DIM ----
   gemmini_config_ld(MATMUL_K * sizeof(elem_t));
@@ -146,12 +154,15 @@ int main() {
 //  printf("SMEM at address %x = %lx \n", smem_addr + 2, *(smem_addr+2));
 
 
+#ifdef SPIKE_SIM
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+#else
   printf("Moving out:\n");
-//  gemmini_mvout((void*)((uint64_t*) C_hw), SPAD_DEST);
   for (int i = 0; i < tiles_J*tiles_I*2; i++) {
       gemmini_mvout((void*)((uint64_t*) C_hw + i*2*DIM), SPAD_DEST + i*DIM);
   }
   gemmini_fence();
+#endif
 
   // ---- Debug print tile (0,0) ----
 //  printf("=== Tile (0,0) - acc_addr=0x%08x ===\n", acc_addr);

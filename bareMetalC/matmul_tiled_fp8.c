@@ -22,12 +22,14 @@
 #define GEMMINI_RS2_ADDR (GEMMINI_CTRL + 0x18)
 #define GEMMINI_INST_ADDR (GEMMINI_CTRL + 0x0)
 
+#ifndef SPIKE_SIM
 #undef ROCC_INSTRUCTION_RS1_RS2
 #define ROCC_INSTRUCTION_RS1_RS2(x, rs1, rs2, funct) { \
     *((volatile uint64_t *) GEMMINI_RS1_ADDR) = (rs1); \
     *((volatile uint64_t *) GEMMINI_RS2_ADDR) = (rs2); \
     *((volatile uint32_t*) GEMMINI_INST_ADDR) = (0x7B) | (0 << 7) | (3 << 12) | (1 << 15) | (2 << 20) | ((funct) << 25); \
 }
+#endif
 
 #define ADDR_LEN 32
 
@@ -73,9 +75,10 @@ int main() {
   gemmini_flush(0);
   gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
 
-  // ---- Load scale factors ----
+#ifndef SPIKE_SIM
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, 512);
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, 512);
+#endif
 
   // ---- MVIN A: tile (i,k) -> a_base + (i*tiles_K + k)*DIM ----
   gemmini_config_ld(MATMUL_M * sizeof(elem_t));
@@ -126,15 +129,17 @@ int main() {
 //    }
 //  }
 
+#ifdef SPIKE_SIM
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+#else
   uint64_t* smem_start_addr = ((uint64_t*)SMEM) + SPAD_DEST * 2;
   printf("Address: %p \n", smem_start_addr);
   for (int i = 0; i < MATMUL_M; i ++) {
     for (int j = 0; j < OUT_COLS; j++) {
-//       printf("addr: %p \n", smem_start_addr + (i*8 + j) );
-//       printf("Elem: %d = %lx \n", i * 32 + j, *(smem_start_addr + (i*8 + j)));
         C_hw[i][j] = *(smem_start_addr + (i*8 + j));
     }
   }
+#endif
 
 
 //  gemmini_mvout((void*)&C_hw[0][0], 128 )

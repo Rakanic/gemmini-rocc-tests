@@ -61,6 +61,18 @@
 #define k_LOOP_WS_CONFIG_SPAD_AB 24
 #define k_LOOP_WS_CONFIG_SPAD_C 25
 #define CONFIG_SCALE_MEM 26
+#define k_MX_LOAD_SCALES 27
+#define k_MX_READ_SMEM 28
+
+#define gemmini_mx_load_scales(dram_addr, len, sel) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, (uint64_t)(dram_addr), \
+    ((uint64_t)(sel) << 32) | ((uint64_t)(len) & 0xFFFFFFFFu), \
+    k_MX_LOAD_SCALES)
+
+#define gemmini_mx_read_smem(dram_addr, smem_off_bf16, num_bf16) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, (uint64_t)(dram_addr), \
+    ((uint64_t)(num_bf16) << 32) | ((uint64_t)(smem_off_bf16) & 0xFFFFFFFFu), \
+    k_MX_READ_SMEM)
 
 #define CONFIG_EX 0
 #define CONFIG_LD 1
