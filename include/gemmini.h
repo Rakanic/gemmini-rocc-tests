@@ -63,6 +63,14 @@
 #define CONFIG_SCALE_MEM 26
 #define k_MX_LOAD_SCALES 27
 #define k_MX_READ_SMEM 28
+#define k_MX_LOAD_LUT  29
+
+// Load num_luts × (16 6-bit FP6 codes) from DRAM (3 LE uint32 per LUT).
+// sel: 0 = B (weight), 1 = A (activation), 2 = C (output)
+#define gemmini_mx_load_lut(dram_addr, num_luts, sel) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, (uint64_t)(dram_addr), \
+    ((uint64_t)(sel) << 32) | ((uint64_t)(num_luts) & 0xFFFFFFFFu), \
+    k_MX_LOAD_LUT)
 
 #define gemmini_mx_load_scales(dram_addr, len, sel) \
   ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, (uint64_t)(dram_addr), \

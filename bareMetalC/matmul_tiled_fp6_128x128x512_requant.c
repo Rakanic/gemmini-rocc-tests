@@ -54,9 +54,11 @@
 #undef GEMMINI_BUSY_ADDR
 #define GEMMINI_BUSY_ADDR (GEMMINI_CTRL + 0x20)
 
+#ifndef SPIKE_SIM
 #undef gemmini_fence
 //#define gemmini_fence() { while (gemmini_status()); }
 #define gemmini_fence() { while (*((volatile uint32_t *) GEMMINI_BUSY_ADDR)) asm volatile ("nop"); }
+#endif
 
 // TODO: Confirm this enum's values are correct
 #ifdef FP8
@@ -69,12 +71,14 @@
 #endif
 #endif
 
+#ifndef SPIKE_SIM
 #undef ROCC_INSTRUCTION_RS1_RS2
 #define ROCC_INSTRUCTION_RS1_RS2(x, rs1, rs2, funct) { \
   *((volatile uint64_t *) GEMMINI_RS1_ADDR) = (rs1); \
   *((volatile uint64_t *) GEMMINI_RS2_ADDR) = (rs2); \
   *((volatile uint32_t*) GEMMINI_INST_ADDR) = (0x7B) | (0 << 7) | (3 << 12) | (1 << 15) | (2 << 20) | ((funct) << 25); \
 }
+#endif
 
 // typedef uint8_t elem_t;
 // typedef uint8_t welem_t;
@@ -138,8 +142,14 @@ int main() {
 
    // MVIN B
 
+#ifdef SPIKE_SIM
+  gemmini_mx_load_lut((uint64_t)&B_lut[0][0], (MATMUL_N >> QUANT_LUT_UPDATE_GRANULARITY), 0);
+  gemmini_mx_load_lut((uint64_t)&A_lut[0][0], (MATMUL_M >> QUANT_LUT_UPDATE_GRANULARITY), 1);
+  gemmini_mx_load_lut((uint64_t)&C_lut[0][0], (MATMUL_M >> QUANT_LUT_UPDATE_GRANULARITY), 2);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+#else
 #ifdef USE_LUT_DEF
-  // LUTs pre-packed by lut_mapping_demo.py: uint32_t [N_groups][3], direct write
   for (size_t i = 0; i < (MATMUL_N >> QUANT_LUT_UPDATE_GRANULARITY); i++) {
     volatile uint32_t *dst = ((volatile uint32_t *) GEMMINI_LUT0_ADDR) + 3 * i;
     dst[0] = B_lut[i][0]; dst[1] = B_lut[i][1]; dst[2] = B_lut[i][2];
@@ -157,6 +167,7 @@ int main() {
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M*MATMUL_GK);
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N*MATMUL_GK);
   gemmini_fence();
+#endif
   //gemmini_config_ld(MATMUL_M * sizeof(elem_t));
   // Tile counts
   // A_in_hw[MATMUL_M/2][MATMUL_K]: tiles_I m-tiles x tiles_K k-tiles, each K_TILE hw-rows x DIM bytes
@@ -232,20 +243,20 @@ int main() {
 
   gemmini_fence();
 
-  // MVOUT
-  // gemmini_mvout((void *) C_hw, (1u << (ADDR_LEN - 1)));
-  //gemmini_mvout_spad(dst_addr, (1u << (ADDR_LEN - 1)))
+#ifdef SPIKE_SIM
+  // FP6 requant: packed 4-bit C_lut indices, 2 per byte. (M/2)*N bytes = M*N/4 uint16.
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N / 4);
+#else
   uint64_t* smem_start_addr = ((uint64_t*)SMEM) + SPAD_DEST * 2;
   printf("Address: %p \n", smem_start_addr);
   for (int i = 0; i < MATMUL_M/2; i ++) {
     for (int j = 0; j < OUT_COLS; j++) {
-//       printf("addr: %p \n", smem_start_addr + (i*8 + j) );
-//       printf("Elem: %d = %lx \n", i * MATMUL_M + j, *(smem_start_addr + (i*OUT_COLS + j)));
         C_hw[i][j] = *(smem_start_addr + (i*OUT_COLS + j));
     }
   }
 
   gemmini_fence();
+#endif
 
  int errors = 0;
   int diff1 = 0, diff2 = 0, diff3plus = 0;

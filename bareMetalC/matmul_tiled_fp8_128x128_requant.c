@@ -47,12 +47,14 @@ typedef uint8_t  welem_t;  // fp8:e4m3 weight elements
 typedef uint64_t out_t;    // 4x bf16 packed per word
 
 // ---- Scale factor loader ----
-void load_scale_factors(volatile uint64_t *sf_mem, uint8_t *scale_factors, int n) {
-  for (size_t i = 0; i < n / 8; i++) {
-    sf_mem[i] = 0x7f7f7f7f7f7f7f7f;
+void load_scale_factors(volatile uint64_t *sf_mem, uint8_t *scale_factors, int INDIM, int K) {
+  for (size_t k = 0; k < K/32; k++) {
+    for (size_t i = 0; i < INDIM / 8; i++) {
+//        printf("loading: %lx\n", ((uint64_t*) scale_factors)[k * INDIM/8 + i]);
+        sf_mem[k*INDIM/8 + i] = ((uint64_t*) scale_factors)[k * INDIM/8 + i];
+    }
   }
 }
-
 
 
 static inline int popcount8(uint8_t x) {
@@ -95,8 +97,8 @@ int main() {
   gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
   gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
 #else
-  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, 1024);
-  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, 1024);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
 #endif
 
   // ---- MVIN A: tile (i,k) -> a_base + (i*tiles_K + k)*DIM ----
@@ -150,7 +152,7 @@ int main() {
 //  }
 
 #ifdef SPIKE_SIM
-  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N / 2);
 #else
   uint64_t* smem_start_addr = ((uint64_t*)SMEM) + SPAD_DEST * 2;
   printf("Address: %p \n", smem_start_addr);
