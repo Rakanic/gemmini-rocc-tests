@@ -9,7 +9,8 @@ tests = \
 	mlp1_32 \
 	mlp2_32 \
 	mlp3_32 \
-	mlp4_32
+	mlp4_32 \
+	mnist_mxgemmini
 
 tests_baremetal = $(tests:=-baremetal)
 runs_baremetal = $(addsuffix .run,$(tests_baremetal))
