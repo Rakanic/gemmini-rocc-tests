@@ -28,9 +28,17 @@ from fp8_matmul_model import (
     matrix_mx_requantize,
 )
 
-M = 16
+# M and N are padded out to a 4x4 tile grid (tiles_I = tiles_J = 4). The RTL MX
+# store path computes its scratchpad stride as (loop_bound_j / 2) * 2, which
+# collapses to 0 for tiles_J = 1 (N = 16) and corrupts the store DMA's command
+# tracking (DMACommandTracker assert(cmds(cmd_id).valid)). Every passing
+# matmul_tiled RTL test uses a square tile grid with tiles_J >= 4, so we match
+# them. Rows beyond NUM_CLASSES are dummy images and columns beyond NUM_CLASSES
+# are zero; classification only reads the first NUM_CLASSES rows/cols, so the
+# padding does not affect the result.
+M = 64
 K = 256
-N = 16
+N = 64
 NUM_CLASSES = 10
 IMG_H = IMG_W = 16
 assert K == IMG_H * IMG_W

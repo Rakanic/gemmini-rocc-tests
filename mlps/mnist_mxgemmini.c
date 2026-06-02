@@ -15,18 +15,79 @@
 #define BF16_PER_WORD 4
 #define OUT_COLS (MATMUL_N / BF16_PER_WORD)
 
-static float bf16_to_float(uint16_t b) {
-  union { uint32_t u; float f; } u;
-  u.u = ((uint32_t)b) << 16;
-  return u.f;
+// On RadianceGemminiOnlyConfig the Gemmini is driven over MMIO rather than the
+// RoCC interface, so real custom-3 instructions (and the spike-only
+// gemmini_mx_load_scales / gemmini_mx_read_smem modeling ops) trap. The
+// #ifndef SPIKE_SIM paths below mirror bareMetalC/matmul_tiled_fp8_64x64.c:
+// command words are written to the MMIO control registers, scale factors are
+// written straight into the scale-factor memory, and the output is read back
+// directly out of the scratchpad.
+#define GEMMINI_SF_MEM 0x40088000
+#define GEMMINI_SF_MEM_A (GEMMINI_SF_MEM + 0x2000)
+#define GEMMINI_SF_MEM_B GEMMINI_SF_MEM
+#define SMEM 0x40000000
+
+#define GEMMINI_CTRL 0x40084000
+#define GEMMINI_RS1_ADDR (GEMMINI_CTRL + 0x10)
+#define GEMMINI_RS2_ADDR (GEMMINI_CTRL + 0x18)
+#define GEMMINI_INST_ADDR (GEMMINI_CTRL + 0x0)
+#define GEMMINI_BUSY_ADDR (GEMMINI_CTRL + 0x20)
+
+#ifndef SPIKE_SIM
+#undef ROCC_INSTRUCTION_RS1_RS2
+#define ROCC_INSTRUCTION_RS1_RS2(x, rs1, rs2, funct) { \
+    *((volatile uint64_t *) GEMMINI_RS1_ADDR) = (rs1); \
+    *((volatile uint64_t *) GEMMINI_RS2_ADDR) = (rs2); \
+    *((volatile uint32_t*) GEMMINI_INST_ADDR) = (0x7B) | (0 << 7) | (3 << 12) | (1 << 15) | (2 << 20) | ((funct) << 25); \
+}
+
+// Over MMIO the default RoCC fence does not drain Gemmini's DMA queues, so a
+// fence that returns before the mvout store completes lets the store
+// controller's DMACommandTracker free a command that responses are still
+// arriving for (DMACommandTracker.scala assert(cmds(cmd_id).valid)). Match the
+// largest matmul_tiled tests and spin on the busy register instead.
+#undef gemmini_fence
+#define gemmini_fence() { while (*((volatile uint32_t *) GEMMINI_BUSY_ADDR)) asm volatile ("nop"); }
+
+// MMIO write of the per-group scale factors into the scale-factor memory.
+// scale_factors is laid out as [K/32][INDIM] bytes (8 per uint64 word).
+static void load_scale_factors(volatile uint64_t *sf_mem, uint8_t *scale_factors, int INDIM, int K) {
+  for (size_t k = 0; k < K/32; k++) {
+    for (size_t i = 0; i < INDIM / 8; i++) {
+      sf_mem[k*INDIM/8 + i] = ((uint64_t*) scale_factors)[k * INDIM/8 + i];
+    }
+  }
+}
+#endif
+
+#ifdef BAREMETAL
+// Override the weak handle_trap (which silently exits 1337) so an unexpected
+// trap reports its cause/epc instead. mcause: 1=instr access, 2=illegal instr,
+// 5=load access fault, 7=store access fault, etc.
+extern void exit(int);
+uintptr_t handle_trap(uintptr_t cause, uintptr_t epc, uintptr_t regs[32]) {
+  printf("\n*** TRAP mcause=0x%lx mepc=0x%lx ***\n",
+         (unsigned long)cause, (unsigned long)epc);
+  exit(2);
+  return 0;
+}
+#endif
+
+// The RTL core has no FP unit, so compare bf16 logits with integer ops only.
+// Map each bf16 (IEEE sign/exp/mantissa) bit pattern to a monotonically
+// ordered unsigned key: positives get the sign bit set (so they sort above
+// negatives), negatives are bit-inverted (so larger magnitude sorts lower).
+// argmax over the keys is then argmax over the real values.
+static uint16_t bf16_order_key(uint16_t b) {
+  return b ^ ((b & 0x8000) ? 0xFFFF : 0x8000);
 }
 
 static int argmax_first_n(const uint16_t row[MATMUL_N], int n) {
   int best = 0;
-  float best_v = bf16_to_float(row[0]);
+  uint16_t best_k = bf16_order_key(row[0]);
   for (int j = 1; j < n; j++) {
-    float v = bf16_to_float(row[j]);
-    if (v > best_v) { best_v = v; best = j; }
+    uint16_t k = bf16_order_key(row[j]);
+    if (k > best_k) { best_k = k; best = j; }
   }
   return best;
 }
@@ -40,7 +101,7 @@ int main() {
 #endif
 
   static uint64_t C_hw[MATMUL_M][OUT_COLS];
-  uint32_t out_scales[512] = {0};
+  static uint32_t out_scales[512] = {0};
   memset(C_hw, 0, sizeof(C_hw));
 
   int tiles_I = MATMUL_M / DIM;
@@ -54,8 +115,13 @@ int main() {
   gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
                               1, 1, 0, 0, false, 0, 0, 3, 0);
 
+#ifdef SPIKE_SIM
   gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
   gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+#else
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
+#endif
 
   gemmini_config_ld(MATMUL_K * sizeof(uint8_t));
   for (int i = 0; i < tiles_I; i++) {
@@ -66,11 +132,15 @@ int main() {
     }
   }
 
+  // B is [K][N] row-major in DRAM, so the scratchpad tiles must be laid out
+  // k-major (k*tiles_J + j) to match what gemmini_loop_ws_spad expects -- same
+  // as bareMetalC/matmul_tiled_fp8_128x128x256.c. (A j-major layout happens to
+  // coincide only when tiles_J == 1, which is why the single-tile case worked.)
   gemmini_config_ld(MATMUL_N * sizeof(uint8_t));
-  for (int j = 0; j < tiles_J; j++) {
-    for (int k = 0; k < tiles_K; k++) {
+  for (int k = 0; k < tiles_K; k++) {
+    for (int j = 0; j < tiles_J; j++) {
       const uint8_t *dram_ptr = ((const uint8_t*)B_in) + k * DIM * MATMUL_N + j * DIM;
-      uint32_t sp_addr = b_base + (j * tiles_K + k) * DIM;
+      uint32_t sp_addr = b_base + (k * tiles_J + j) * DIM;
       gemmini_extended_mvin((void *) dram_ptr, sp_addr, DIM, DIM);
     }
   }
@@ -96,8 +166,19 @@ int main() {
       0x38);
   uint64_t end = read_cycles();
 
-  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+  // Drain the mvout store DMA before reading results back.
   gemmini_fence();
+
+#ifdef SPIKE_SIM
+  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+#else
+  uint64_t* smem_start_addr = ((uint64_t*)SMEM) + SPAD_DEST * 2;
+  for (int i = 0; i < MATMUL_M; i++) {
+    for (int j = 0; j < OUT_COLS; j++) {
+      C_hw[i][j] = *(smem_start_addr + (i*OUT_COLS + j));
+    }
+  }
+#endif
 
   int bf16_errors = 0;
   for (int i = 0; i < MATMUL_M; i++) {
@@ -117,7 +198,8 @@ int main() {
     }
   }
 
-  uint16_t logits[MATMUL_M][MATMUL_N];
+  // static: at 64x64 this is 8 KB and would otherwise blow the baremetal stack.
+  static uint16_t logits[MATMUL_M][MATMUL_N];
   for (int i = 0; i < MATMUL_M; i++) {
     for (int j = 0; j < OUT_COLS; j++) {
       uint64_t w = C_hw[i][j];
