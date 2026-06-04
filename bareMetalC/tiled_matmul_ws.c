@@ -176,6 +176,7 @@ int main() {
     }
 #endif
 
+  printf("PASS\n");
   exit(0);
 }
 
