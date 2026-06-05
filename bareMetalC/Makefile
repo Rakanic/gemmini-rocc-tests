@@ -80,6 +80,14 @@ mx_tests = \
 	matmul_tiled_fp8_128x128x256_DRAMMvout \
 	matmul_tiled_fp8_64x64_requant \
 	matmul_tiled_fp8_128x128_requant \
+	matmul_tiled_fp8_64x96x64 \
+	matmul_tiled_fp8_64x96x64_requant \
+	matmul_tiled_fp8_96x32x32 \
+	matmul_tiled_fp8_96x32x32_requant \
+	matmul_tiled_fp8_96x96x64 \
+	matmul_tiled_fp8_96x96x64_requant \
+	matmul_tiled_fp8_32x32x32 \
+	matmul_tiled_fp8_32x32x32_requant \
 	matmul_tiled_fp4_64x64_requant \
 	matmul_tiled_fp4_128x128_requant \
 	matmul_tiled_fp4_128x128x512_requant \
