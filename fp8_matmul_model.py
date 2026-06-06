@@ -515,7 +515,16 @@ def tensor_to_custom_fp_codes(t: Tensor, spec: str) -> Tuple[List[List[int]], in
                 av = abs(v)
                 E = math.floor(math.log2(av))
                 if E < emin:
-                    code = 0
+                    # Subnormal range: quantum = 2^(emin - m_bits)
+                    quantum = 2.0 ** (emin - m_bits)
+                    k = int(round(av / quantum))
+                    if k <= 0:
+                        code = 0
+                    elif k >= 2**m_bits:
+                        # Rounds up to min normal (biased_exp=1, mant=0)
+                        code = (s << (e_bits + m_bits)) | (1 << m_bits)
+                    else:
+                        code = (s << (e_bits + m_bits)) | k  # subnormal: biased_exp=0
                 else:
                     if E > emax:
                         E_used = emax
