@@ -9,6 +9,9 @@
 
 #include "include/gemmini_testutils.h"
 #include "include/matmul_fp8_64x64.h"
+#ifdef MX_ROCKET
+#include "include/gemmini_mx_rocket.h"   // standalone: direct RoCC, flat scale window, mvout output
+#endif
 
 #define GEMMINI_SF_MEM 0x40088000
 #define GEMMINI_SF_MEM_A (GEMMINI_SF_MEM + 0x2000)
@@ -22,7 +25,9 @@
 #define GEMMINI_RS2_ADDR (GEMMINI_CTRL + 0x18)
 #define GEMMINI_INST_ADDR (GEMMINI_CTRL + 0x0)
 
-#ifndef SPIKE_SIM
+// Radiance RTL drives gemmini via an MMIO command mimic. The standalone rocket config (MX_ROCKET)
+// is a real RoCC, so keep gemmini.h's default direct-RoCC macro there.
+#if !defined(SPIKE_SIM) && !defined(MX_ROCKET)
 #undef ROCC_INSTRUCTION_RS1_RS2
 #define ROCC_INSTRUCTION_RS1_RS2(x, rs1, rs2, funct) { \
     *((volatile uint64_t *) GEMMINI_RS1_ADDR) = (rs1); \
@@ -80,9 +85,14 @@ int main() {
 #ifdef SPIKE_SIM
   gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
   gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
-#else
+#elif !defined(MX_ROCKET)
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
+#endif
+#ifdef MX_ROCKET
+  // Flat scale window (same loader as radiance, different base): A=activation, W=weight(B).
+  load_scale_factors((volatile uint64_t *) MX_SCALE_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *) MX_SCALE_W, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
 #endif
 
   // ---- MVIN A: tile (i,k) -> a_base + (i*tiles_K + k)*DIM ----
@@ -110,6 +120,17 @@ int main() {
   gemmini_config_st(OUT_COLS * sizeof(out_t));
   gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
 
+  // Standalone (MX_ROCKET) has ex_write_to_spad=false, so the BF16 mesh output never reaches
+  // the scratchpad; it lives in the accumulator. Compute into the accumulator and mvout from
+  // there (the DRAMMvout path). flag 0xb8 skips the spad store; 0x38 keeps it for radiance/smem.
+#ifdef MX_ROCKET
+  uint32_t out_dest = acc_addr;
+  uint32_t out_flag = 0xb8;
+#else
+  uint32_t out_dest = SPAD_DEST;
+  uint32_t out_flag = 0x38;
+#endif
+
   // ---- Compute ----
   gemmini_loop_ws_spad(
       tiles_I, tiles_J, tiles_K,
@@ -117,13 +138,13 @@ int main() {
       a_base,
       BANK_NUM * BANK_ROWS,
       0,
-      SPAD_DEST,
+      out_dest,
       false, false,
       false, false, false,
       NO_ACTIVATION,
       0, 0,
       false,
-      0x38);
+      out_flag);
 
 //  for (int i = 0; i < tiles_I; i++) {
 //    for (int j = 0; j < tiles_J; j++) {
@@ -135,6 +156,26 @@ int main() {
 
 #ifdef SPIKE_SIM
   gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+#elif defined(MX_ROCKET)
+  // Standalone: no shared memory; mvout the BF16 output from the accumulator to DRAM.
+  // On the MX config the accumulator read port is HALF-WIDTH: one mvout returns 8 lanes
+  // (32 BF16 = cols 0-31, "chunk 0"); cols 32-63 are the upper 8 lanes of the SAME acc rows,
+  // selected by mx_chunk_id=1. The stock gemmini_mvout macro hardwires mx_chunk_id=0, so we
+  // emit one mvout per chunk with mx_chunk_id set directly in MvoutRs2.
+  //   MvoutRs2: num_rows @ bit 48 (mvout_rows_bits = log2Up(2*DIM+1) = 6 for DIM=16),
+  //   mx_chunk_id (3b) just above it -> bit 48+6 = 54. config_st (full BF16 row stride) unchanged.
+  #define MX_CHUNK_SHIFT (48 + 6)
+  gemmini_fence();
+  for (int i = 0; i < tiles_I; i++) {
+    for (int ck = 0; ck < 2; ck++) {   // 2 half-chunks: ck0 = cols 0-31, ck1 = cols 32-63
+      uint32_t acc_tile_addr = acc_addr + i * DIM;
+      out_t *dram_ptr = &C_hw[i * DIM][ck * (32 / BF16_PER_WORD)];  // ck*8 out_t = ck*32 BF16
+      ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, (uint64_t)(uintptr_t)dram_ptr,
+          ((uint64_t)(DIM) << (ADDR_LEN + 16)) | ((uint64_t)(ck) << MX_CHUNK_SHIFT) |
+          ((uint64_t)(DIM) << ADDR_LEN) | (uint64_t)(acc_tile_addr), k_MVOUT);
+    }
+  }
+  gemmini_fence();
 #else
   uint64_t* smem_start_addr = ((uint64_t*)SMEM) + SPAD_DEST * 2;
   printf("Address: %p \n", smem_start_addr);

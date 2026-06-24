@@ -143,6 +143,9 @@ CFLAGS := $(CFLAGS) \
 	-DID_STRING=$(ID_STRING) \
 	-DPRINT_TILE=0 \
 
+# Extra flags appended without clobbering CFLAGS (e.g. -DMX_ROCKET for MxGemminiRocketConfig).
+CFLAGS := $(CFLAGS) $(EXTRA_CFLAGS)
+
 CFLAGS_PK := \
 	$(CFLAGS) \
 	-static \
