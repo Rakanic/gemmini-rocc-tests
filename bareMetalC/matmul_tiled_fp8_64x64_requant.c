@@ -130,16 +130,11 @@ int main() {
   gemmini_config_st(1 * sizeof(out_t));
   gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
 
-  // Standalone (MX_ROCKET) has ex_write_to_spad=false, so the requantized output never reaches
-  // the scratchpad; it lives in the accumulator. Compute into the accumulator and mvout from
-  // there. flag 0xb8 skips the spad store; 0x38 keeps it for radiance/smem.
-#ifdef MX_ROCKET
-  uint32_t out_dest = acc_addr;
-  uint32_t out_flag = 0xb8;
-#else
+  // V1: ex_write_to_spad=true (MX) routes the requantizer FP8 output into the INTERNAL scratchpad
+  // (Scratchpad requantwrite source). Compute to SPAD_DEST with the 0x38 requant-to-spad flag for
+  // every path; standalone (MX_ROCKET) then mvout's the spad region to DRAM and checks vs C_out.
   uint32_t out_dest = SPAD_DEST;
   uint32_t out_flag = 0x38;
-#endif
 
   // ---- Compute ----
   gemmini_loop_ws_spad(
@@ -167,27 +162,19 @@ int main() {
 #ifdef SPIKE_SIM
   gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N / 2);
 #elif defined(MX_ROCKET)
-  // Standalone: no shared memory; the requantized FP8 output lives in the ACCUMULATOR
-  // (ex_write_to_spad=false, so nothing lands in the scratchpad). Requant applies during the
-  // acc->DRAM mvout: the MxRequantizer is on the accumulator read path (acc_scale_unit), gated
-  // by enable_MXQuant (set above by gemmini_mxquant_config_mvout), not by the destination.
-  // The acc read port is HALF-WIDTH: one mvout returns 32 FP8 = cols 0-31 ("chunk 0"); cols
-  // 32-63 are the upper half of the SAME acc rows, selected by mx_chunk_id=1. The stock
-  // gemmini_mvout macro hardwires mx_chunk_id=0, so emit one mvout per chunk with mx_chunk_id
-  // set directly in MvoutRs2.
-  //   MvoutRs2: num_rows @ bit 48 (mvout_rows_bits = log2Up(2*DIM+1) = 6 for DIM=16),
-  //   mx_chunk_id (3b) just above it -> bit 48+6 = 54. config_st = full FP8 row stride.
-  #define MX_CHUNK_SHIFT (48 + 6)
+  // V1: the requant FP8 output now lives in the INTERNAL scratchpad (ex_write_to_spad=true routes
+  // the requantizer output to the banks). Read it back with a plain spad->DRAM mvout -- spad reads
+  // are full-width (16 FP8/row), NOT chunked like the acc path, and FP8 is byte-aligned.
+  // LAYOUT HYPOTHESIS (verify in sim): the requant store writes the output row-major-contiguous
+  // from SPAD_DEST (output row r -> 4 consecutive spad rows holding cols 0-15,16-31,32-47,48-63).
+  // Then spad row m (16 FP8) maps to DRAM byte m*16; with m = 4*r+c this is C_hw[r][16*c], i.e. a
+  // flat contiguous mvout reproduces C_hw. If sim shows a scrambled pattern, adjust this mapping.
   gemmini_fence();
-  gemmini_config_st(MATMUL_N * sizeof(uint8_t));
-  for (int i = 0; i < tiles_I; i++) {
-    for (int ck = 0; ck < 2; ck++) {   // 2 half-chunks: ck0 = cols 0-31, ck1 = cols 32-63
-      uint32_t acc_tile_addr = acc_addr + i * DIM;
-      uint8_t *dram_ptr = (uint8_t *) C_hw + (i * DIM) * MATMUL_N + ck * 32;  // ck*32 FP8 bytes
-      ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, (uint64_t)(uintptr_t)dram_ptr,
-          ((uint64_t)(DIM) << (ADDR_LEN + 16)) | ((uint64_t)(ck) << MX_CHUNK_SHIFT) |
-          ((uint64_t)(DIM) << ADDR_LEN) | (uint64_t)(acc_tile_addr), k_MVOUT);
-    }
+  gemmini_config_st(DIM * sizeof(uint8_t));               // one spad row = DIM (16) FP8 bytes
+  uint8_t *c_base = (uint8_t *) C_hw;
+  int total_spad_rows = MATMUL_M * MATMUL_N / DIM;         // 64*64/16 = 256 spad rows
+  for (int r = 0; r < total_spad_rows; r += DIM) {
+    gemmini_extended_mvout(c_base + r * DIM, SPAD_DEST + r, DIM, DIM);  // DIM rows x DIM FP8
   }
   gemmini_fence();
 #else
