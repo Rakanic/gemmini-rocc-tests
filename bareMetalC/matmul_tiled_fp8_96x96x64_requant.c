@@ -9,6 +9,9 @@
 
 #include "include/gemmini_testutils.h"
 #include "include/matmul_fp8_96x96x64.h"
+#ifdef MX_ROCKET
+#include "include/gemmini_mx_rocket.h"   // standalone: direct RoCC, flat scale window, spad mvout
+#endif
 
 #define GEMMINI_SF_MEM 0x40088000
 #define GEMMINI_SF_MEM_A (GEMMINI_SF_MEM + 0x2000)
@@ -22,7 +25,8 @@
 #define GEMMINI_RS2_ADDR (GEMMINI_CTRL + 0x18)
 #define GEMMINI_INST_ADDR (GEMMINI_CTRL + 0x0)
 
-#ifndef SPIKE_SIM
+// MX_ROCKET is a real RoCC; keep gemmini.h's direct macro (0x40084xxx unbacked on standalone).
+#if !defined(SPIKE_SIM) && !defined(MX_ROCKET)
 #undef ROCC_INSTRUCTION_RS1_RS2
 #define ROCC_INSTRUCTION_RS1_RS2(x, rs1, rs2, funct) { \
     *((volatile uint64_t *) GEMMINI_RS1_ADDR) = (rs1); \
@@ -84,9 +88,14 @@ int main() {
 #ifdef SPIKE_SIM
   gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
   gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
-#else
+#elif !defined(MX_ROCKET)
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
+#endif
+#ifdef MX_ROCKET
+  // Flat scale window (same loader as radiance, different base): A=activation, W=weight(B).
+  load_scale_factors((volatile uint64_t *) MX_SCALE_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *) MX_SCALE_W, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
 #endif
 
   // ---- MVIN A: tile (i,k) -> a_base + (i*tiles_K + k)*DIM ----
@@ -133,6 +142,19 @@ int main() {
 
 #ifdef SPIKE_SIM
   gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N / 2);
+#elif defined(MX_ROCKET)
+  // V1: requant FP8 output lives in the INTERNAL scratchpad; read it back with a plain full-width
+  // spad->DRAM mvout (FP8 byte-aligned, NOT chunked). Flat row-major-contiguous from SPAD_DEST as
+  // proven at 64x64/128x128 requant. N=96 -> 576 spad rows. If the partial 64-block breaks the flat
+  // contiguity, switch to the loop-store spad dst geometry (LoopMatmul dst_offset) -- verify in sim.
+  gemmini_fence();
+  gemmini_config_st(DIM * sizeof(uint8_t));               // one spad row = DIM (16) FP8 bytes
+  uint8_t *c_base = (uint8_t *) C_hw;
+  int total_spad_rows = MATMUL_M * MATMUL_N / DIM;         // 96*96/16 = 576 spad rows
+  for (int r = 0; r < total_spad_rows; r += DIM) {
+    gemmini_extended_mvout(c_base + r * DIM, SPAD_DEST + r, DIM, DIM);  // DIM rows x DIM FP8
+  }
+  gemmini_fence();
 #else
   uint64_t* smem_start_addr = ((uint64_t*)SMEM) + SPAD_DEST * 2;
   printf("Address: %p \n", smem_start_addr);

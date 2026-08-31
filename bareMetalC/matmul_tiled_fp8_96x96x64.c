@@ -9,6 +9,9 @@
 
 #include "include/gemmini_testutils.h"
 #include "include/matmul_fp8_96x96x64.h"
+#ifdef MX_ROCKET
+#include "include/gemmini_mx_rocket.h"   // standalone: direct RoCC, flat scale window, acc mvout
+#endif
 
 #define GEMMINI_SF_MEM 0x40088000
 #define GEMMINI_SF_MEM_A (GEMMINI_SF_MEM + 0x2000)
@@ -22,7 +25,8 @@
 #define GEMMINI_RS2_ADDR (GEMMINI_CTRL + 0x18)
 #define GEMMINI_INST_ADDR (GEMMINI_CTRL + 0x0)
 
-#ifndef SPIKE_SIM
+// MX_ROCKET is a real RoCC; keep gemmini.h's direct macro (0x40084xxx unbacked on standalone).
+#if !defined(SPIKE_SIM) && !defined(MX_ROCKET)
 #undef ROCC_INSTRUCTION_RS1_RS2
 #define ROCC_INSTRUCTION_RS1_RS2(x, rs1, rs2, funct) { \
     *((volatile uint64_t *) GEMMINI_RS1_ADDR) = (rs1); \
@@ -79,9 +83,14 @@ int main() {
 #ifdef SPIKE_SIM
   gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
   gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
-#else
+#elif !defined(MX_ROCKET)
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
+#endif
+#ifdef MX_ROCKET
+  // Flat scale window (same loader as radiance, different base): A=activation, W=weight(B).
+  load_scale_factors((volatile uint64_t *) MX_SCALE_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *) MX_SCALE_W, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
 #endif
 
   // ---- MVIN A: tile (i,k) -> a_base + (i*tiles_K + k)*DIM ----
@@ -111,6 +120,16 @@ int main() {
   gemmini_config_st(OUT_COLS * sizeof(out_t));
   gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
 
+  // Standalone (MX_ROCKET) has ex_write_to_spad=false -> BF16 output lives in the accumulator.
+  // Compute into the accumulator (0xb8 skips the spad store); radiance/smem keeps SPAD_DEST/0x38.
+#ifdef MX_ROCKET
+  uint32_t out_dest = acc_addr;
+  uint32_t out_flag = 0xb8;
+#else
+  uint32_t out_dest = SPAD_DEST;
+  uint32_t out_flag = 0x38;
+#endif
+
   // ---- Compute ----
   gemmini_loop_ws_spad(
       tiles_I, tiles_J, tiles_K,
@@ -118,16 +137,41 @@ int main() {
       a_base,
       BANK_NUM * BANK_ROWS,
       0,
-      SPAD_DEST,
+      out_dest,
       false, false,
       false, false, false,
       NO_ACTIVATION,
       0, 0,
       false,
-      0x38);
+      out_flag);
 
 #ifdef SPIKE_SIM
   gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+#elif defined(MX_ROCKET)
+  // Interleaved acc readback with a PARTIAL last col-block (N=96 not a multiple of 64). Each 64-wide
+  // col block occupies DIM acc rows per row-tile: tile (i,cb) at acc row (i*col_blocks+cb)*DIM, where
+  // col_blocks = ceil(N/64) = iter_max_j (LoopMatmul.scala:825). cb0 = full 64 cols (2 chunks); the
+  // last block may be a 32-col partial (1 chunk). mx_chunk_id picks the 32-col half of a block.
+  // config_st = full BF16 row stride.
+  #define MX_CHUNK_SHIFT (48 + 6)
+  int col_blocks = (MATMUL_N + 63) / 64;   // iter_max_j (ceil), N=96 -> 2
+  gemmini_fence();
+  gemmini_config_st(OUT_COLS * sizeof(out_t));
+  for (int i = 0; i < tiles_I; i++) {
+    for (int cb = 0; cb < col_blocks; cb++) {
+      int block_cols = MATMUL_N - cb * 64;
+      if (block_cols > 64) block_cols = 64;             // 64 (full) or 32 (partial)
+      int chunks = (block_cols + 31) / 32;              // 2 (full) or 1 (partial)
+      for (int ck = 0; ck < chunks; ck++) {
+        uint32_t acc_tile_addr = acc_addr + (i * col_blocks + cb) * DIM;
+        out_t *dram_ptr = &C_hw[i * DIM][(cb * 64 + ck * 32) / BF16_PER_WORD];
+        ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, (uint64_t)(uintptr_t)dram_ptr,
+            ((uint64_t)(DIM) << (ADDR_LEN + 16)) | ((uint64_t)(ck) << MX_CHUNK_SHIFT) |
+            ((uint64_t)(DIM) << ADDR_LEN) | (uint64_t)(acc_tile_addr), k_MVOUT);
+      }
+    }
+  }
+  gemmini_fence();
 #else
   uint64_t* smem_start_addr = ((uint64_t*)SMEM) + SPAD_DEST * 2;
   printf("Address: %p \n", smem_start_addr);
