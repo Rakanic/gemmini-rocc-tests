@@ -133,7 +133,11 @@ int main() {
 
   int SPAD_DEST = 128;
 
-  gemmini_config_st(1 * sizeof(out_t));   // match the passing 64x64 requant (V1 spad path)
+#ifdef MX_ROCKET
+  gemmini_config_st(1 * sizeof(out_t));   // V1 spad path: match the passing 64x64 requant
+#else
+  gemmini_config_st(OUT_COLS * sizeof(out_t));   // radiance path unchanged
+#endif
   gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
 
   // ---- Compute ----

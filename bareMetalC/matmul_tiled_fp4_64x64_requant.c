@@ -9,6 +9,9 @@
 
 #include "include/gemmini_testutils.h"
 #include "include/matmul_fp4_64x64.h"
+#ifdef MX_ROCKET
+#include "include/gemmini_mx_rocket.h"   // standalone: direct RoCC, flat scale window, spad mvout
+#endif
 
 #define GEMMINI_SF_MEM 0x40088000
 #define GEMMINI_SF_MEM_A (GEMMINI_SF_MEM + 0x2000)
@@ -25,7 +28,7 @@
 #define GEMMINI_RS2_ADDR (GEMMINI_CTRL + 0x18)
 #define GEMMINI_INST_ADDR (GEMMINI_CTRL + 0x0)
 
-#ifndef SPIKE_SIM
+#if !defined(SPIKE_SIM) && !defined(MX_ROCKET)
 #undef ROCC_INSTRUCTION_RS1_RS2
 #define ROCC_INSTRUCTION_RS1_RS2(x, rs1, rs2, funct) { \
     *((volatile uint64_t *) GEMMINI_RS1_ADDR) = (rs1); \
@@ -36,7 +39,7 @@
 
 #define ADDR_LEN 32
 
-#ifndef SPIKE_SIM
+#if !defined(SPIKE_SIM) && !defined(MX_ROCKET)
 #undef gemmini_fence
 #define gemmini_fence() { while (*((volatile uint32_t *) GEMMINI_BUSY_ADDR)) asm volatile ("nop"); }
 #endif
@@ -96,6 +99,9 @@ int main() {
 #ifdef SPIKE_SIM
   gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
   gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+#elif defined(MX_ROCKET)
+  load_scale_factors((volatile uint64_t *) MX_SCALE_A, (uint8_t *) &A_scales_row, 1024);
+  load_scale_factors((volatile uint64_t *) MX_SCALE_W, (uint8_t *) &B_scales_col, 1024);
 #else
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, 1024);
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, 1024);
@@ -124,7 +130,11 @@ int main() {
 
   int SPAD_DEST = 128;
 
+#ifdef MX_ROCKET
+  gemmini_config_st(1 * sizeof(out_t));
+#else
   gemmini_config_st(OUT_COLS * sizeof(out_t));
+#endif
   gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
 
   // ---- Compute ----
@@ -153,6 +163,17 @@ int main() {
 #ifdef SPIKE_SIM
   // FP4 requant: M*N fp4 codes packed 2 per byte = M*N/4 uint16 words.
   gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N / 4);
+#elif defined(MX_ROCKET)
+  // V1: requant FP4 output lives in the internal spad (2 fp4/byte, 2 output rows per spad byte-row).
+  // PROVISIONAL flat spad->DRAM readback (geometry verified/fixed in F7). Total bytes = M*N/2.
+  gemmini_fence();
+  gemmini_config_st(DIM * sizeof(uint8_t));
+  uint8_t *c_base = (uint8_t *) C_hw;
+  int total_spad_rows = MATMUL_M * MATMUL_N / 2 / DIM;   // fp4: M*N/2 bytes / 16 bytes-per-row
+  for (int r = 0; r < total_spad_rows; r += DIM) {
+    gemmini_extended_mvout(c_base + r * DIM, SPAD_DEST + r, DIM, DIM);
+  }
+  gemmini_fence();
 #else
   uint64_t* smem_start_addr = ((uint64_t*)SMEM) + SPAD_DEST * 2;
   printf("Address: %p \n", smem_start_addr);
