@@ -100,8 +100,9 @@ int main() {
   gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
   gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
 #elif defined(MX_ROCKET)
-  load_scale_factors((volatile uint64_t *) MX_SCALE_A, (uint8_t *) &A_scales_row, 1024);
-  load_scale_factors((volatile uint64_t *) MX_SCALE_W, (uint8_t *) &B_scales_col, 1024);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+  gemmini_fence();
 #else
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, 1024);
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, 1024);

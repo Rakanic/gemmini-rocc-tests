@@ -100,9 +100,11 @@ int main() {
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
 #endif
 #ifdef MX_ROCKET
-  // Flat scale window (same loader as radiance, different base): A=activation, W=weight(B).
-  load_scale_factors((volatile uint64_t *) MX_SCALE_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
-  load_scale_factors((volatile uint64_t *) MX_SCALE_W, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
+  // ISA parity with the Spike model: funct-27 MX_LOAD_SCALES DMA loader (same call as SPIKE_SIM),
+  // replacing the flat CPU scale window. sel 0 = A/activation-row, 1 = B/weight-col.
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+  gemmini_fence();
 #endif
 
   // ---- MVIN A: tile (i,k) -> a_base + (i*tiles_K + k)*DIM ----

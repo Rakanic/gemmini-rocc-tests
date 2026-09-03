@@ -156,13 +156,13 @@ int main() {
   gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
   gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
 #elif defined(MX_ROCKET)
-  // Standalone: go-triggered whole-table LUT loads over the CPU-reachable regmap.
-  // Port mapping matches radiance regmap + spike sel: 0=weight(B), 1=act-in(A), 2=act-out(C).
-  mx_load_lut(MX_LUT0, &B_lut[0][0]);   // weight
-  mx_load_lut(MX_LUT1, &A_lut[0][0]);   // activation-in
-  mx_load_lut(MX_LUT2, &C_lut[0][0]);   // activation-out
-  load_scale_factors((volatile uint64_t *) MX_SCALE_A, (uint8_t *) &A_scales_row, MATMUL_M*MATMUL_GK);
-  load_scale_factors((volatile uint64_t *) MX_SCALE_W, (uint8_t *) &B_scales_col, MATMUL_N*MATMUL_GK);
+  // ISA parity: funct-29 MX_LOAD_LUT DMA loader (same call as SPIKE_SIM), replacing the CPU regmap.
+  // sel: 0 = weight(B), 1 = act-in(A), 2 = act-out(C).
+  gemmini_mx_load_lut((uint64_t)&B_lut[0][0], (MATMUL_N >> QUANT_LUT_UPDATE_GRANULARITY), 0);
+  gemmini_mx_load_lut((uint64_t)&A_lut[0][0], (MATMUL_M >> QUANT_LUT_UPDATE_GRANULARITY), 1);
+  gemmini_mx_load_lut((uint64_t)&C_lut[0][0], (MATMUL_M >> QUANT_LUT_UPDATE_GRANULARITY), 2);
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
   gemmini_fence();
 #else
 #ifdef USE_LUT_DEF
