@@ -25,7 +25,7 @@
 #define GEMMINI_RS2_ADDR (GEMMINI_CTRL + 0x18)
 #define GEMMINI_INST_ADDR (GEMMINI_CTRL + 0x0)
 
-#ifndef SPIKE_SIM
+#if !defined(SPIKE_SIM) && !defined(MX_ROCKET)
 #undef ROCC_INSTRUCTION_RS1_RS2
 #define ROCC_INSTRUCTION_RS1_RS2(x, rs1, rs2, funct) { \
     *((volatile uint64_t *) GEMMINI_RS1_ADDR) = (rs1); \
@@ -36,7 +36,7 @@
 
 #define ADDR_LEN 32
 
-#ifndef SPIKE_SIM
+#if !defined(SPIKE_SIM) && !defined(MX_ROCKET)
 #undef gemmini_fence
 #define gemmini_fence() { while (*((volatile uint32_t *) GEMMINI_BUSY_ADDR)) asm volatile ("nop"); }
 #endif
@@ -96,9 +96,10 @@ int main() {
   gemmini_flush(0);
   gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 2, 2, 3, 0);
 
-#ifdef SPIKE_SIM
+#if defined(SPIKE_SIM) || defined(MX_ROCKET)
   gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
   gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+  gemmini_fence();
 #else
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
@@ -156,8 +157,16 @@ int main() {
 
   gemmini_fence();
 
-#ifdef SPIKE_SIM
-  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
+#if defined(SPIKE_SIM) || defined(MX_ROCKET)
+  // Internal-spad readback (Spike deposit + RTL F2c/V1 spad store): flat spad->DRAM mvout.
+  gemmini_fence();
+  gemmini_config_st(DIM * sizeof(uint8_t));
+  uint8_t *c_base = (uint8_t *) C_hw;
+  int total_spad_rows = MATMUL_M * MATMUL_N * 2 / DIM;
+  for (int r = 0; r < total_spad_rows; r += DIM) {
+    gemmini_extended_mvout(c_base + r * DIM, SPAD_DEST + r, DIM, DIM);
+  }
+  gemmini_fence();
 #else
   uint64_t* smem_start_addr = ((uint64_t*)SMEM) + SPAD_DEST * 2;
   printf("Address: %p \n", smem_start_addr);
