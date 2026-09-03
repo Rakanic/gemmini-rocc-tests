@@ -9,9 +9,6 @@
 
 #include "include/gemmini_testutils.h"
 #include "include/matmul_fp8_128x128.h"
-#ifdef MX_ROCKET
-#include "include/gemmini_mx_rocket.h"   // standalone: direct RoCC, flat scale window, spad mvout
-#endif
 
 #define GEMMINI_SF_MEM 0x40088000
 #define GEMMINI_SF_MEM_A (GEMMINI_SF_MEM + 0x2000)
@@ -98,18 +95,15 @@ int main() {
   gemmini_flush(0);
   gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 0, 0);
 
-#ifdef SPIKE_SIM
-  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
-  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
-#elif !defined(MX_ROCKET)
-  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
-  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
-#endif
-#ifdef MX_ROCKET
-  // ISA parity: funct-27 MX_LOAD_SCALES DMA loader (same call as SPIKE_SIM), not the flat window.
+#if defined(SPIKE_SIM) || defined(MX_ROCKET)
+  // Unified real-RoCC path (Spike AND RTL): funct-27 MX_LOAD_SCALES. The fence orders the async
+  // scale DMA on the RTL and is a no-op on Spike, so both emit the identical instruction stream.
   gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
   gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
   gemmini_fence();
+#else
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
 #endif
 
   // ---- MVIN A: tile (i,k) -> a_base + (i*tiles_K + k)*DIM ----
@@ -134,7 +128,7 @@ int main() {
 
   int SPAD_DEST = 128;
 
-#ifdef MX_ROCKET
+#if defined(MX_ROCKET) || defined(SPIKE_SIM)
   gemmini_config_st(1 * sizeof(out_t));   // V1 spad path: match the passing 64x64 requant
 #else
   gemmini_config_st(OUT_COLS * sizeof(out_t));   // radiance path unchanged
@@ -166,9 +160,7 @@ int main() {
 //    }
 //  }
 
-#ifdef SPIKE_SIM
-  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N / 2);
-#elif defined(MX_ROCKET)
+#if defined(SPIKE_SIM) || defined(MX_ROCKET)
   // V1: the requant FP8 output lives in the INTERNAL scratchpad (ex_write_to_spad=true routes the
   // requantizer output to the banks). Read it back with a plain spad->DRAM mvout -- spad reads are
   // full-width (16 FP8/row), byte-aligned, NOT chunked like the acc path.

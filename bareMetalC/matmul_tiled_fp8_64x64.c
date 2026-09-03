@@ -9,9 +9,6 @@
 
 #include "include/gemmini_testutils.h"
 #include "include/matmul_fp8_64x64.h"
-#ifdef MX_ROCKET
-#include "include/gemmini_mx_rocket.h"   // standalone: direct RoCC, flat scale window, mvout output
-#endif
 
 #define GEMMINI_SF_MEM 0x40088000
 #define GEMMINI_SF_MEM_A (GEMMINI_SF_MEM + 0x2000)
@@ -82,18 +79,15 @@ int main() {
   gemmini_flush(0);
   gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
 
-#ifdef SPIKE_SIM
-  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
-  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
-#elif !defined(MX_ROCKET)
-  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
-  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
-#endif
-#ifdef MX_ROCKET
-  // ISA parity: funct-27 MX_LOAD_SCALES DMA loader (same call as SPIKE_SIM), not the flat window.
+#if defined(SPIKE_SIM) || defined(MX_ROCKET)
+  // Unified real-RoCC path (Spike AND RTL): funct-27 MX_LOAD_SCALES. The fence orders the async
+  // scale DMA on the RTL and is a no-op on Spike, so both emit the identical instruction stream.
   gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
   gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
   gemmini_fence();
+#else
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
+  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
 #endif
 
   // ---- MVIN A: tile (i,k) -> a_base + (i*tiles_K + k)*DIM ----
@@ -124,13 +118,10 @@ int main() {
   // Standalone (MX_ROCKET) has ex_write_to_spad=false, so the BF16 mesh output never reaches
   // the scratchpad; it lives in the accumulator. Compute into the accumulator and mvout from
   // there (the DRAMMvout path). flag 0xb8 skips the spad store; 0x38 keeps it for radiance/smem.
-#ifdef MX_ROCKET
-  uint32_t out_dest = acc_addr;
-  uint32_t out_flag = 0xb8;
-#else
+  // Spad path (matches Spike + radiance + the non-requant fp4/fp6): F2c full-width BF16 store to the
+  // internal scratchpad (0x38), then a flat spad->DRAM mvout. Unified across all targets.
   uint32_t out_dest = SPAD_DEST;
   uint32_t out_flag = 0x38;
-#endif
 
   // ---- Compute ----
   gemmini_loop_ws_spad(
@@ -155,26 +146,15 @@ int main() {
 //    }
 //  }
 
-#ifdef SPIKE_SIM
-  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
-#elif defined(MX_ROCKET)
-  // Standalone: no shared memory; mvout the BF16 output from the accumulator to DRAM.
-  // On the MX config the accumulator read port is HALF-WIDTH: one mvout returns 8 lanes
-  // (32 BF16 = cols 0-31, "chunk 0"); cols 32-63 are the upper 8 lanes of the SAME acc rows,
-  // selected by mx_chunk_id=1. The stock gemmini_mvout macro hardwires mx_chunk_id=0, so we
-  // emit one mvout per chunk with mx_chunk_id set directly in MvoutRs2.
-  //   MvoutRs2: num_rows @ bit 48 (mvout_rows_bits = log2Up(2*DIM+1) = 6 for DIM=16),
-  //   mx_chunk_id (3b) just above it -> bit 48+6 = 54. config_st (full BF16 row stride) unchanged.
-  #define MX_CHUNK_SHIFT (48 + 6)
+#if defined(SPIKE_SIM) || defined(MX_ROCKET)
+  // Non-requant BF16 in internal spad (F2c full-width store, row-major). Flat spad->DRAM readback:
+  // BF16 = 2 bytes/elem -> M*N*2/DIM spad rows. Identical instruction stream on Spike and RTL.
   gemmini_fence();
-  for (int i = 0; i < tiles_I; i++) {
-    for (int ck = 0; ck < 2; ck++) {   // 2 half-chunks: ck0 = cols 0-31, ck1 = cols 32-63
-      uint32_t acc_tile_addr = acc_addr + i * DIM;
-      out_t *dram_ptr = &C_hw[i * DIM][ck * (32 / BF16_PER_WORD)];  // ck*8 out_t = ck*32 BF16
-      ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, (uint64_t)(uintptr_t)dram_ptr,
-          ((uint64_t)(DIM) << (ADDR_LEN + 16)) | ((uint64_t)(ck) << MX_CHUNK_SHIFT) |
-          ((uint64_t)(DIM) << ADDR_LEN) | (uint64_t)(acc_tile_addr), k_MVOUT);
-    }
+  gemmini_config_st(DIM * sizeof(uint8_t));
+  uint8_t *c_base = (uint8_t *) C_hw;
+  int total_spad_rows = MATMUL_M * MATMUL_N * 2 / DIM;
+  for (int r = 0; r < total_spad_rows; r += DIM) {
+    gemmini_extended_mvout(c_base + r * DIM, SPAD_DEST + r, DIM, DIM);
   }
   gemmini_fence();
 #else

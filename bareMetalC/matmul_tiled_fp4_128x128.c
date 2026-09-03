@@ -9,9 +9,6 @@
 
 #include "include/gemmini_testutils.h"
 #include "include/matmul_fp4_128x128.h"
-#ifdef MX_ROCKET
-#include "include/gemmini_mx_rocket.h"   // standalone: direct RoCC, flat scale window, spad mvout
-#endif
 
 #define GEMMINI_SF_MEM 0x40088000
 #define GEMMINI_SF_MEM_A (GEMMINI_SF_MEM + 0x2000)
@@ -97,10 +94,7 @@ int main() {
   gemmini_flush(0);
   gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 2, 2, 3, 0);
 
-#ifdef SPIKE_SIM
-  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
-  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
-#elif defined(MX_ROCKET)
+#if defined(SPIKE_SIM) || defined(MX_ROCKET)
   gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
   gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
   gemmini_fence();
@@ -158,9 +152,7 @@ int main() {
 //    }
 //  }
 
-#ifdef SPIKE_SIM
-  gemmini_mx_read_smem(&C_hw[0][0], SPAD_DEST * 16, MATMUL_M * MATMUL_N);
-#elif defined(MX_ROCKET)
+#if defined(SPIKE_SIM) || defined(MX_ROCKET)
   // Non-requant BF16 in internal spad (full-width store, row-major). Flat spad->DRAM readback,
   // 1-1 with radiance / the passing 64x64. BF16 = 2 bytes/elem -> M*N*2/DIM spad rows.
   gemmini_fence();
