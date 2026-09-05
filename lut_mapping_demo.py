@@ -271,8 +271,22 @@ def write_tensor_bins(base_dir: str, A_indices: torch.Tensor, B_indices: torch.T
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
-A = torch.randn(M, K, device=DEV, dtype=torch.float32)
-B = torch.randn(K, N, device=DEV, dtype=torch.float32)
+
+# MXGEMMINI_LLAMA=1 swaps the synthetic operands for real TinyLlama activations and weights, and
+# (below) the random LUTs and random scale exponents for ones derived from that data. Everything
+# else in this script -- index assignment, HW packing, mesh model, requant -- is unchanged.
+USE_LLAMA = os.environ.get("MXGEMMINI_LLAMA", "0") == "1"
+LLAMA_LAYER = os.environ.get("MXGEMMINI_LLAMA_LAYER", "layer4")
+LLAMA_PROJ = os.environ.get("MXGEMMINI_LLAMA_PROJ", "mlp.gate_proj")
+
+if USE_LLAMA:
+    import llama_operands
+    A, B = llama_operands.load_pair(LLAMA_LAYER, LLAMA_PROJ, M, K, N)
+    print(f"[llama] operands {LLAMA_LAYER}/{LLAMA_PROJ}  A{tuple(A.shape)} "
+          f"|max|={A.abs().max():.6g}  B{tuple(B.shape)} |max|={B.abs().max():.6g}")
+else:
+    A = torch.randn(M, K, device=DEV, dtype=torch.float32)
+    B = torch.randn(K, N, device=DEV, dtype=torch.float32)
 
 
 # ── Build LUTs (from matmul_data_mx_fp6.h) ────────────────────────────────────
@@ -342,24 +356,44 @@ def fp6e3m2_nearest_finder(in_fp6: int, in_lut: list) -> int:
 # Every 2^QUANT_LUT_UPDATE_GRANULARITY rows of A share one LUT; same for B cols
 G = QUANT_LUT_UPDATE_GRANULARITY
 print("[Step 1]: Generate the luts for fp6 projection")
-A_luts = [make_lut(INPUT_SPEC, LUT_INDEX_BITS, DEV) for _ in range(M >> G)]  # M >> G LUTs
-B_luts = [make_lut(INPUT_SPEC, LUT_INDEX_BITS, DEV) for _ in range(N >> G)]  # N >> G LUTs
-C_luts = [make_lut(INPUT_SPEC, LUT_INDEX_BITS, DEV) for _ in range(M >> G)]  # M >> G LUTs
+if USE_LLAMA:
+    # MX-quantize first (so every value is already a valid FP6 code), then reduce that codebook to
+    # 16 signposts per LUT group -- MXQuant's level-2 scheme, see llama_operands.build_luts. The
+    # block scales come from the same quantization instead of torch.randint.
+    from app.mxquant import e8m0_decode as _e8m0_decode
+    _cb = llama_operands.fp6_codebook()
+    A_P, A_scale_codes = llama_operands.mx_quantize(A, axis="row")
+    B_P, B_scale_codes = llama_operands.mx_quantize(B, axis="col")
+    A_luts = llama_operands.build_luts(A_P, axis="row", G=G, lut_size=LUT_SIZE, codebook=_cb)
+    B_luts = llama_operands.build_luts(B_P, axis="col", G=G, lut_size=LUT_SIZE, codebook=_cb)
+    C_luts = [make_lut(INPUT_SPEC, LUT_INDEX_BITS, DEV) for _ in range(M >> G)]
 
-print("[Step 2]: Generate the projected data")
-A_indices = torch.stack([quantize_lut_indices(A_luts[i >> G], A[i])      for i in range(M)])        # (M, K)
-B_indices = torch.stack([quantize_lut_indices(B_luts[j >> G], B[:, j])   for j in range(N)], dim=1) # (K, N)
-#C_indices = torch.stack([quantize_lut_indices(C_luts[j], C[:, j])   for j in range(N)], dim=1) # (K, N)
+    print("[Step 2]: Generate the projected data")
+    A_indices = torch.stack([quantize_lut_indices(A_luts[i >> G], A_P[i]) for i in range(M)])
+    B_indices = torch.stack([quantize_lut_indices(B_luts[j >> G], B_P[:, j]) for j in range(N)],
+                            dim=1)
 
-A_scale_exp = torch.randint(low=-4, high=4, size=(M, Gk), device=DEV)
-B_scale_exp = torch.randint(low=-4, high=4, size=(Gk, N), device=DEV)
+    print("[Step 3]: Generate E8M0 scales")
+    A_scales_row_q = torch.from_numpy(_e8m0_decode(A_scale_codes).astype(np.float32))   # (M, Gk)
+    B_scales_col_q = torch.from_numpy(_e8m0_decode(B_scale_codes).astype(np.float32))   # (Gk, N)
+else:
+    A_luts = [make_lut(INPUT_SPEC, LUT_INDEX_BITS, DEV) for _ in range(M >> G)]  # M >> G LUTs
+    B_luts = [make_lut(INPUT_SPEC, LUT_INDEX_BITS, DEV) for _ in range(N >> G)]  # N >> G LUTs
+    C_luts = [make_lut(INPUT_SPEC, LUT_INDEX_BITS, DEV) for _ in range(M >> G)]  # M >> G LUTs
 
-A_scales_row = torch.pow(2.0, A_scale_exp.to(torch.float32))
-B_scales_col = torch.pow(2.0, B_scale_exp.to(torch.float32))
+    print("[Step 2]: Generate the projected data")
+    A_indices = torch.stack([quantize_lut_indices(A_luts[i >> G], A[i])      for i in range(M)])        # (M, K)
+    B_indices = torch.stack([quantize_lut_indices(B_luts[j >> G], B[:, j])   for j in range(N)], dim=1) # (K, N)
 
-print("[Step 3]: Generate E8M0 scales")
-A_scales_row_q = make_fp_quantizer(SCALE_SPEC, "nearest")(A_scales_row)
-B_scales_col_q = make_fp_quantizer(SCALE_SPEC, "nearest")(B_scales_col)
+    A_scale_exp = torch.randint(low=-4, high=4, size=(M, Gk), device=DEV)
+    B_scale_exp = torch.randint(low=-4, high=4, size=(Gk, N), device=DEV)
+
+    A_scales_row = torch.pow(2.0, A_scale_exp.to(torch.float32))
+    B_scales_col = torch.pow(2.0, B_scale_exp.to(torch.float32))
+
+    print("[Step 3]: Generate E8M0 scales")
+    A_scales_row_q = make_fp_quantizer(SCALE_SPEC, "nearest")(A_scales_row)
+    B_scales_col_q = make_fp_quantizer(SCALE_SPEC, "nearest")(B_scales_col)
 
 
 print("[Step 4]: Generate HW like results C_out")

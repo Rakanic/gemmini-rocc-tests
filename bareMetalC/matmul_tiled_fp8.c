@@ -8,7 +8,12 @@
 #endif
 
 #include "include/gemmini_testutils.h"
-#include "include/matmul_data_mx_fp8.h"
+// Shares matmul_tiled_fp8_32x32x32's generated golden (real TinyLlama tensors through MXQuant --
+// see gen_matmul_llama.py). The old matmul_data_mx_fp8.h declared MATMUL_GK 16 for K=32, i.e. a
+// 2-element scale group, which contradicts the block-32 MX convention every other test and both
+// oracles use. This test differs from matmul_tiled_fp8_32x32x32 only in its A/B mvin layout, so
+// pointing both at one golden makes it a genuine check of that second layout.
+#include "include/matmul_fp8_32x32x32.h"
 
 #define GEMMINI_SF_MEM 0x40088000
 #define GEMMINI_SF_MEM_A (GEMMINI_SF_MEM + 0x2000)
@@ -75,7 +80,14 @@ int main() {
   gemmini_flush(0);
   gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
 
-#ifndef SPIKE_SIM
+#if defined(SPIKE_SIM) || defined(MX_ROCKET)
+  // This branch did not exist: under SPIKE_SIM the test loaded NO scales at all, so the mesh ran
+  // against whatever mx_scale_{a,b}_mem happened to hold and the check could never pass. The
+  // funct-27 MX_LOAD_SCALES path is the same one every other MX test uses.
+  gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
+  gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
+  gemmini_fence();
+#else
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, 512);
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, 512);
 #endif

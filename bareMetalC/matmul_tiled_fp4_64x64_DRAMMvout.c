@@ -127,6 +127,19 @@ int main() {
   gemmini_config_st(2*OUT_COLS * sizeof(out_t));
   gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
 
+  // Spike's MX datapath has NO accumulator destination. mx_loop_ws_spad derives its output index
+  // as smem_base = C_spad * DIM (gemmini.cc:1154) and indexes mx_smem with it unchecked, so
+  // handing it acc_addr = 1<<31 gives smem_base = 0x800000000 and segfaults the simulator. The one
+  // MX output route Spike models is the internal scratchpad -- which is also where
+  // gemmini_mx_read_smem reads from below, at offset 0.
+#ifdef SPIKE_SIM
+  uint32_t c_dest = 0;
+  uint32_t c_flag = 0x38;      // keep the spad store; there is no accumulator to skip to
+#else
+  uint32_t c_dest = acc_addr;
+  uint32_t c_flag = 0xb8;      // skips the spad store; the output lands in the accumulator
+#endif
+
   // ---- Compute ----
   gemmini_loop_ws_spad(
       tiles_I, tiles_J, tiles_K,
@@ -134,13 +147,13 @@ int main() {
       a_base,
       BANK_NUM * BANK_ROWS,
       0,
-      acc_addr,
+      c_dest,
       false, false,
       false, false, false,
       NO_ACTIVATION,
       0, 0,
       false,
-      0xb8);
+      c_flag);
 
 //  for (int i = 0; i < tiles_I; i++) {
 //    for (int j = 0; j < tiles_J; j++) {

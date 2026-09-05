@@ -309,10 +309,27 @@ int main() {
     }
   }
 
-  if (errors == 0) {
+  // ---- Check the E8M0 block scales the requantizer wrote to scale_factors ----
+  // The requant writes ROW-MAJOR (sf_bytes[m*GN + b]); fp6's golden is the TRANSPOSE
+  // C_scales_row[GN][M], so compare against C_scales_row[b][m].
+  int scale_errors = 0;
+  uint8_t *sf_bytes = (uint8_t *) scale_factors;
+  for (int i = 0; i < MATMUL_M; i++) {
+    for (int b = 0; b < MATMUL_GN; b++) {
+      uint8_t got = sf_bytes[i * MATMUL_GN + b];
+      uint8_t exp = C_scales_row[b][i];
+      if (got != exp) {
+        scale_errors++;
+        if (scale_errors <= 20)
+          printf("Scale[%d][%d], Got: %x, Exp: %x\n", i, b, got, exp);
+      }
+    }
+  }
+
+  if (errors == 0 && scale_errors == 0) {
     printf("fp8 WS matmul test PASSED (no mismatches).\n");
   } else {
-    printf("fp8 WS matmul test FAILED with %d mismatches.\n", errors);
+    printf("fp8 WS matmul test FAILED: %d code, %d scale mismatches.\n", errors, scale_errors);
     printf("  differ by 1 bit:   %d\n", diff1);
     printf("  differ by 2 bits:  %d\n", diff2);
     printf("  differ by 3+ bits: %d\n", diff3plus);

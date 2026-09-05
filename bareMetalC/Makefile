@@ -121,7 +121,10 @@ else
 endif
 
 BENCH_COMMON = $(abs_top_srcdir)/riscv-tests/benchmarks/common
-GEMMINI_HEADERS = $(abs_top_srcdir)/include/gemmini.h $(abs_top_srcdir)/include/gemmini_params.h $(abs_top_srcdir)/include/gemmini_testutils.h
+# The matmul_*.h data headers are generated (gen_matmul_llama.py), so they must be prerequisites
+# too. Without them a regenerated golden leaves the ELF untouched and the test silently re-runs the
+# OLD data -- which still PASSES, because the stale header is self-consistent.
+GEMMINI_HEADERS = $(abs_top_srcdir)/include/gemmini.h $(abs_top_srcdir)/include/gemmini_params.h $(abs_top_srcdir)/include/gemmini_testutils.h $(wildcard $(abs_top_srcdir)/include/matmul_*.h)
 
 CFLAGS := $(CFLAGS) \
 	-DPREALLOCATE=1 \
