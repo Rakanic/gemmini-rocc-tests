@@ -510,13 +510,22 @@ def _run_mesh(A_P: np.ndarray, A_scales: np.ndarray,
     return C
 
 
-def _requant_fp8(C_bf16: np.ndarray, f: Format):
-    """Requantize a BF16 tile to fp8. Returns (codes [M][N], scales [M][N/32], P [M][N] values).
+def _requant(C_bf16: np.ndarray, f: Format):
+    """Requantize a BF16 tile. Returns (codes, scales [M][N/32], P values).
 
-    P is the fp8 code VALUE of each element -- what a subsequent matmul multiplies when this tile
-    is reused as an operand -- so it is captured (build() discards it).
+    P is the block-normalized code VALUE of each element -- what a subsequent matmul multiplies when
+    this tile is reused as an operand (P * 2^(scale-127) == the element value, so reusing BOTH codes
+    and scales preserves the value regardless of the pmax convention). fp8 uses MXQuant's requantizer
+    (out_requant="mxquant"); fp4/fp6 use the hardware quantizer via matrix_mx_requantize ("model").
     """
-    assert f.out_requant == "mxquant", "chain golden is fp8-only for now"
+    if f.out_requant == "model":
+        from app.mxq_golden import e8m0_encode_exact
+        mm = __import__(f.model)
+        C_q, C_sc = mm.matrix_mx_requantize(torch.from_numpy(C_bf16), f.name)
+        codes = np.array(mm.tensor_to_custom_fp_codes(C_q, f.name)[0], dtype=np.uint8)
+        scales = e8m0_encode_exact(C_sc.numpy().astype(np.float32))
+        P = C_q.numpy().astype(np.float32)
+        return codes, scales, P
     codes, scales, P = quantize(C_bf16, axis="row", f=f, pmax_shift=f.out_pmax)
     return codes, scales, P
 
@@ -539,9 +548,8 @@ def load_B2(shape: Shape) -> np.ndarray:
 
 
 def build_chain(shape: Shape, verbose: bool = True) -> dict[str, np.ndarray]:
-    """MM1 = A1@B1 -> C1 (fp8, resident); MM2 = C1@B2 -> C2 (fp8). Returns all header arrays."""
+    """MM1 = A1@B1 -> C1 (resident); MM2 = C1@B2 -> C2. Returns all header arrays. Any MX format."""
     f = FORMATS[shape.fmt]
-    assert f.name.startswith("fp8"), "chain golden is fp8-only for now"
 
     A1, B1 = load_pair(shape)
     B2 = load_B2(shape)
@@ -553,13 +561,13 @@ def build_chain(shape: Shape, verbose: bool = True) -> dict[str, np.ndarray]:
     A1_codes, A1_scales, A1_P = quantize(A1, axis="row", f=f)   # [M][GK]
     B1_codes, B1_scales, B1_P = quantize(B1, axis="col", f=f)   # [GK][N]
     C1_bf16 = _run_mesh(A1_P, A1_scales, B1_P, B1_scales, f)
-    C1_codes, C1_scales, C1_P = _requant_fp8(C1_bf16, f)        # C1_scales [M][N/32]
+    C1_codes, C1_scales, C1_P = _requant(C1_bf16, f)           # C1_scales [M][N/32]
 
-    # MM2: C1 (resident fp8) @ B2. A2 fed exactly as the mesh reads C1 -----------------------
+    # MM2: C1 (resident) @ B2. A2 fed exactly as the mesh reads C1 ---------------------------
     B2_codes, B2_scales, B2_P = quantize(B2, axis="col", f=f)   # [GK][N]
-    # A2_P = C1's fp8 code values; A2_scales = C1's output block scales ([M][N1/32] == [M][K2/32]).
+    # A2_P = C1's code values; A2_scales = C1's output block scales ([M][N1/32] == [M][K2/32]).
     C2_bf16 = _run_mesh(C1_P, C1_scales, B2_P, B2_scales, f)
-    C2_codes, C2_scales, C2_P = _requant_fp8(C2_bf16, f)
+    C2_codes, C2_scales, C2_P = _requant(C2_bf16, f)
 
     if verbose:
         mask = (1 << (f.bits - 1)) - 1
@@ -575,6 +583,11 @@ def build_chain(shape: Shape, verbose: bool = True) -> dict[str, np.ndarray]:
 
 
 def emit_chain(shape: Shape, d: dict[str, np.ndarray]) -> Path:
+    """Emit the chained-matmul header, dispatching on element width (fp8 byte vs fp4/fp6 nibble)."""
+    return _emit_chain_fp8(shape, d) if FORMATS[shape.fmt].bits == 8 else _emit_chain_nibble(shape, d)
+
+
+def _emit_chain_fp8(shape: Shape, d: dict[str, np.ndarray]) -> Path:
     """Emit include/matmul_fp8_<M>x<N>_chain.h -- MM1 operands, B2, and both C1 and C2 goldens."""
     f = FORMATS[shape.fmt]
     stem = f"matmul_fp8_{shape.M}x{shape.N}_chain"
@@ -655,6 +668,117 @@ static const uint8_t C2_scales_out[MATMUL_M][MATMUL_GN] = {{
 }};
 
 static const uint16_t C2_out_bf16[MATMUL_M][MATMUL_N] = {{
+{_rows(bf16_bits(d['C2_bf16']), 4)}
+}};
+
+#endif // {guard}
+""")
+    return path
+
+
+def _emit_chain_nibble(shape: Shape, d: dict[str, np.ndarray]) -> Path:
+    """Emit include/matmul_<fp4|fp6>_<M>x<N>_chain.h -- nibble-packed chained matmul.
+
+    A and C go into the HW-tiled layout (`_a_indices_to_hw_layout`, 2 m-rows per byte, low nibble =
+    even row); B and B2 are packed along N (low nibble = even column). Same packers as emit_fp4, so
+    only the data differs. C1_out is the RESIDENT operand + residency check; C2_out the final result.
+    Reusing BOTH C1 codes and C1 scales preserves the value, so the pmax convention is irrelevant.
+    """
+    from lut_golden_model import _a_indices_to_hw_layout
+    f = FORMATS[shape.fmt]
+    M, K, N = shape.M, shape.K, shape.N
+    fmt = f.name.split(":")[0]                       # fp4 / fp6
+    stem = f"matmul_{fmt}_{M}x{N}_chain"
+    guard = f"INCLUDE_{stem.upper()}_H"
+
+    def hw(codes):
+        return np.array(_a_indices_to_hw_layout(codes.tolist(), f.tile_m, f.tile_k), dtype=np.uint8)
+
+    def pack_b(codes):                               # [K][N] indices -> [K][N/2] nibble-packed
+        return ((codes[:, 1::2].astype(np.uint16) << 4) | codes[:, 0::2]).astype(np.uint8)
+
+    A_hw   = hw(d["A_codes"])                         # [M/2][K]
+    B_pk   = pack_b(d["B_codes"])                     # [K][N/2]
+    B2_pk  = pack_b(d["B2_codes"])                    # [K][N/2]
+    C1_hw  = hw(d["C1_codes"])                        # [M/2][N]
+    C2_hw  = hw(d["C2_codes"])                        # [M/2][N]
+
+    path = HERE / "include" / f"{stem}.h"
+    with open(path, "w") as fh:
+        fh.write(f"""// GENERATED by gen_matmul_llama.py chain_{fmt}_{M}x{N} -- do not edit by hand.
+//
+// CHAINED back-to-back {f.name} matmul: C2 = (A1 @ B1) @ B2. MM1's requantized output C1 stays
+// RESIDENT in the scratchpad (block-tiled operand layout) and is reused as MM2's operand A; MM1's
+// output block-scales are reused as MM2's input A-scales. A1/B1 are real TinyLlama tiles from
+// {shape.layer}/{shape.proj}; B2 is a distinct real weight sub-block (next {N} out-features). A and C
+// are in the HW tiled layout (2 m-rows/byte, low nibble = even row); B is packed along N. Block scales
+// on the OUTPUT keep the log2_pmax shift ({fmt} out_pmax={f.out_pmax}); reusing codes AND scales
+// preserves the value regardless.
+#ifndef {guard}
+#define {guard}
+
+#include <stdint.h>
+
+#define MATMUL_M   {M}
+#define MATMUL_K   {K}
+#define MATMUL_N   {N}
+#define MATMUL_GK  {shape.GK}
+#define MATMUL_GN  {shape.GN}
+#define A_TILE_M   {f.tile_m}
+#define K_TILE     {f.tile_k}
+
+// ---- MM1 operands (A1 @ B1) ----
+// A in HW tiled layout [M/2][K]: bits[7:4]=code(row 2r+1,k), bits[3:0]=code(row 2r,k)
+static const uint8_t A_in_hw[{M // 2}][{K}] = {{
+{_rows(A_hw, 2)}
+}};
+
+// B packed [K][N/2]: odd-col nibble high, even-col low
+static const uint8_t B_in[{K}][{N // 2}] = {{
+{_rows(B_pk, 2)}
+}};
+
+static const uint8_t A_scales_row[{shape.GK}][{M}] = {{
+{_rows(d['A_scales'].T, 2)}
+}};
+
+static const uint8_t B_scales_col[{shape.GK}][{N}] = {{
+{_rows(d['B_scales'], 2)}
+}};
+
+// ---- MM2 weight operand (C1 @ B2); C1 comes from the scratchpad, not DRAM ----
+static const uint8_t B2_in[{K}][{N // 2}] = {{
+{_rows(B2_pk, 2)}
+}};
+
+static const uint8_t B2_scales_col[{shape.GK}][{N}] = {{
+{_rows(d['B2_scales'], 2)}
+}};
+
+// ---- MM1 output C1 = requant(A1 @ B1): the RESIDENT operand + residency check (HW tiled [M/2][N]) ----
+static const uint8_t C1_out[{M // 2}][{N}] = {{
+{_rows(C1_hw, 2)}
+}};
+
+// C1 block scales [M][GN] (as the requantizer writes them). These ARE MM2's A-scales.
+static const uint8_t C1_scales_out[{M}][{shape.GN}] = {{
+{_rows(d['C1_scales'], 2)}
+}};
+
+static const uint16_t C1_out_bf16[{M}][{N}] = {{
+{_rows(bf16_bits(d['C1_bf16']), 4)}
+}};
+
+// ---- MM2 output C2 = requant(C1 @ B2): the final chained result (HW tiled [M/2][N]) ----
+static const uint8_t C2_out[{M // 2}][{N}] = {{
+{_rows(C2_hw, 2)}
+}};
+
+static const uint8_t C2_scales_out[{M}][{shape.GN}] = {{
+{_rows(d['C2_scales'], 2)}
+}};
+
+static const uint16_t C2_out_bf16[{M}][{N}] = {{
 {_rows(bf16_bits(d['C2_bf16']), 4)}
 }};
 

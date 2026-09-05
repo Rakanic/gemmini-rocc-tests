@@ -70,6 +70,8 @@ mx_tests = \
 	matmul_tiled_fp6_128x128 \
 	matmul_tiled_fp6_128x128x512 \
 	matmul_tiled_fp6_128x128x512_requant \
+	matmul_tiled_fp6_64x64_chain \
+	matmul_tiled_fp6_128x128_chain \
 	matmul_tiled_fp4_128x128 \
 	matmul_tiled_fp4_128x128x512 \
 	matmul_tiled_fp8_64x64 \
@@ -91,6 +93,8 @@ mx_tests = \
 	matmul_tiled_fp8_32x32x32 \
 	matmul_tiled_fp8_32x32x32_requant \
 	matmul_tiled_fp4_64x64_requant \
+	matmul_tiled_fp4_64x64_chain \
+	matmul_tiled_fp4_128x128_chain \
 	matmul_tiled_fp4_128x128_requant \
 	matmul_tiled_fp4_128x128x512_requant \
 
