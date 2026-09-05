@@ -485,12 +485,202 @@ static const uint16_t C_out_bf16[{M}][{N}] = {{
 EMITTERS = {"fp8": emit, "fp4": emit_fp4}
 
 
+# --- chained (back-to-back) matmul --------------------------------------------------------------
+#
+# C2 = (A1 @ B1) @ B2, all fp8. MM1's requantized fp8 output C1 stays RESIDENT in the scratchpad
+# and is fed to MM2 as operand A -- exactly as the hardware reads it: the fp8 code VALUES multiply
+# in the mesh and C1's block scales apply afterwards. MM1's output block-scales are reused as MM2's
+# input A-scales. This is the golden for matmul_tiled_fp8_64x64_chain.c (Step 2 of the standalone
+# plan): C1_out/C1_scales_out check residency, C2_out/C2_scales_out check the final chained result.
+
+
+def _run_mesh(A_P: np.ndarray, A_scales: np.ndarray,
+              B_P: np.ndarray, B_scales: np.ndarray, f: Format) -> np.ndarray:
+    """A_P @ B_P through the bit-exact mesh model, block scales applied after the raw products."""
+    mm = __import__(f.model)
+    C = mm.tiled_matmul_hwlike(
+        torch.from_numpy(A_P), torch.from_numpy(B_P),
+        torch.from_numpy(e8m0_decode(A_scales).astype(np.float32)),
+        torch.from_numpy(e8m0_decode(B_scales).astype(np.float32)),
+        verbose=False, prod_precision_list=PROD_PRECISION, acc_precision_list=ACC_PRECISION,
+    ).numpy().astype(np.float32)
+    if not np.isfinite(C).all():
+        raise SystemExit("chain: mesh model produced non-finite output -- operands exceed the "
+                         "accumulator bound, pick a different (layer, proj) or B2 slice")
+    return C
+
+
+def _requant_fp8(C_bf16: np.ndarray, f: Format):
+    """Requantize a BF16 tile to fp8. Returns (codes [M][N], scales [M][N/32], P [M][N] values).
+
+    P is the fp8 code VALUE of each element -- what a subsequent matmul multiplies when this tile
+    is reused as an operand -- so it is captured (build() discards it).
+    """
+    assert f.out_requant == "mxquant", "chain golden is fp8-only for now"
+    codes, scales, P = quantize(C_bf16, axis="row", f=f, pmax_shift=f.out_pmax)
+    return codes, scales, P
+
+
+def load_B2(shape: Shape) -> np.ndarray:
+    """A DISTINCT real weight slice for MM2, [K][N]. Same logged W_square, different out-features.
+
+    B1 is W_full[:N, :K].T (see load_pair). B2 takes the NEXT N out-features at the same in-feature
+    offset -> W_full[N:2N, :K].T, so it is genuinely different real weight data of the right shape,
+    not a reshuffle of B1. (This is a distinct real weight sub-block; it does not claim to be the
+    literal next layer -- the point is bit-exact Spike/RTL/model consistency on real values.)
+    """
+    d = DATA / shape.layer / shape.proj
+    with np.load(d / "W_square.npz") as z:
+        W_full = z["data"].astype(np.float32)
+    off = shape.N
+    if W_full.shape[0] < off + shape.N:
+        raise SystemExit(f"{d}/W_square.npz is {W_full.shape}, need >= {off + shape.N} rows for B2")
+    return np.ascontiguousarray(W_full[off:off + shape.N, :shape.K].T)   # [K][N]
+
+
+def build_chain(shape: Shape, verbose: bool = True) -> dict[str, np.ndarray]:
+    """MM1 = A1@B1 -> C1 (fp8, resident); MM2 = C1@B2 -> C2 (fp8). Returns all header arrays."""
+    f = FORMATS[shape.fmt]
+    assert f.name.startswith("fp8"), "chain golden is fp8-only for now"
+
+    A1, B1 = load_pair(shape)
+    B2 = load_B2(shape)
+    if verbose:
+        print(f"  MM1 operands {shape.layer}/{shape.proj}  A1{A1.shape} B1{B1.shape}   "
+              f"MM2 B2{B2.shape} (W out-features {shape.N}..{2*shape.N})")
+
+    # MM1 -------------------------------------------------------------------------------------
+    A1_codes, A1_scales, A1_P = quantize(A1, axis="row", f=f)   # [M][GK]
+    B1_codes, B1_scales, B1_P = quantize(B1, axis="col", f=f)   # [GK][N]
+    C1_bf16 = _run_mesh(A1_P, A1_scales, B1_P, B1_scales, f)
+    C1_codes, C1_scales, C1_P = _requant_fp8(C1_bf16, f)        # C1_scales [M][N/32]
+
+    # MM2: C1 (resident fp8) @ B2. A2 fed exactly as the mesh reads C1 -----------------------
+    B2_codes, B2_scales, B2_P = quantize(B2, axis="col", f=f)   # [GK][N]
+    # A2_P = C1's fp8 code values; A2_scales = C1's output block scales ([M][N1/32] == [M][K2/32]).
+    C2_bf16 = _run_mesh(C1_P, C1_scales, B2_P, B2_scales, f)
+    C2_codes, C2_scales, C2_P = _requant_fp8(C2_bf16, f)
+
+    if verbose:
+        mask = (1 << (f.bits - 1)) - 1
+        print(f"  C1 |max|={np.abs(C1_bf16).max():.6g} peak 0x{int(np.max(C1_codes & mask)):02X} "
+              f"E8M0 {int(C1_scales.min())}..{int(C1_scales.max())}")
+        print(f"  C2 |max|={np.abs(C2_bf16).max():.6g} peak 0x{int(np.max(C2_codes & mask)):02X} "
+              f"E8M0 {int(C2_scales.min())}..{int(C2_scales.max())}")
+
+    return dict(A_codes=A1_codes, A_scales=A1_scales, B_codes=B1_codes, B_scales=B1_scales,
+                B2_codes=B2_codes, B2_scales=B2_scales,
+                C1_codes=C1_codes, C1_scales=C1_scales, C1_bf16=C1_bf16,
+                C2_codes=C2_codes, C2_scales=C2_scales, C2_bf16=C2_bf16)
+
+
+def emit_chain(shape: Shape, d: dict[str, np.ndarray]) -> Path:
+    """Emit include/matmul_fp8_<M>x<N>_chain.h -- MM1 operands, B2, and both C1 and C2 goldens."""
+    f = FORMATS[shape.fmt]
+    stem = f"matmul_fp8_{shape.M}x{shape.N}_chain"
+    guard = f"INCLUDE_{stem.upper()}_H"
+    path = HERE / "include" / f"{stem}.h"
+    with open(path, "w") as fh:
+        fh.write(f"""// GENERATED by gen_matmul_llama.py chain_fp8_64x64 -- do not edit by hand.
+//
+// CHAINED back-to-back fp8 matmul: C2 = (A1 @ B1) @ B2, all {f.name}. MM1's requantized fp8 output
+// C1 stays RESIDENT in the scratchpad and is reused as MM2's operand A; MM1's output block-scales
+// are reused as MM2's input A-scales. A1/B1 are real TinyLlama tiles from {shape.layer}/{shape.proj}
+// (A_square/W_square, block 32, MXQuant). B2 is a distinct real weight sub-block (next {shape.N}
+// out-features of the same W_square). C_out_bf16/C1 are the mesh model + requantizer on MM1; C2 the
+// same on MM2 with C1 fed as the mesh reads it (fp8 code values, block scales applied after).
+#ifndef {guard}
+#define {guard}
+
+#include <stdint.h>
+
+#define MATMUL_M {shape.M}
+#define MATMUL_K {shape.K}
+#define MATMUL_N {shape.N}
+#define MATMUL_GK {shape.GK}
+#define MATMUL_GN {shape.GN}
+
+// ---- MM1 operands (A1 @ B1) ----
+// Input precision: {f.name}
+static const uint8_t A_in[MATMUL_M][MATMUL_K] = {{
+{_rows(d['A_codes'], 2)}
+}};
+
+static const uint8_t B_in[MATMUL_K][MATMUL_N] = {{
+{_rows(d['B_codes'], 2)}
+}};
+
+// A's scale is per row per K-group: a_off = group * M + row
+static const uint8_t A_scales_row[MATMUL_GK][MATMUL_M] = {{
+{_rows(d['A_scales'].T, 2)}
+}};
+
+// B's scale is per column per K-group: b_off = group * N + col
+static const uint8_t B_scales_col[MATMUL_GK][MATMUL_N] = {{
+{_rows(d['B_scales'], 2)}
+}};
+
+// ---- MM2 weight operand (C1 @ B2); C1 comes from the scratchpad, not DRAM ----
+static const uint8_t B2_in[MATMUL_K][MATMUL_N] = {{
+{_rows(d['B2_codes'], 2)}
+}};
+
+static const uint8_t B2_scales_col[MATMUL_GK][MATMUL_N] = {{
+{_rows(d['B2_scales'], 2)}
+}};
+
+// ---- MM1 output C1 = requant(A1 @ B1): the RESIDENT operand + residency check ----
+// C1 fp8 codes (what mvout of the scratchpad must reproduce).
+static const uint8_t C1_out[MATMUL_M][MATMUL_N] = {{
+{_rows(d['C1_codes'], 2)}
+}};
+
+// C1 block scales in the requantizer's [M][N/32] output layout. These ARE MM2's A-scales:
+// C1_scales_out[m][b] == A2's per-row per-K-group scale (N1/32 == K2/32).
+static const uint8_t C1_scales_out[MATMUL_M][MATMUL_GN] = {{
+{_rows(d['C1_scales'], 2)}
+}};
+
+static const uint16_t C1_out_bf16[MATMUL_M][MATMUL_N] = {{
+{_rows(bf16_bits(d['C1_bf16']), 4)}
+}};
+
+// ---- MM2 output C2 = requant(C1 @ B2): the final chained result ----
+static const uint8_t C2_out[MATMUL_M][MATMUL_N] = {{
+{_rows(d['C2_codes'], 2)}
+}};
+
+static const uint8_t C2_scales_out[MATMUL_M][MATMUL_GN] = {{
+{_rows(d['C2_scales'], 2)}
+}};
+
+static const uint16_t C2_out_bf16[MATMUL_M][MATMUL_N] = {{
+{_rows(bf16_bits(d['C2_bf16']), 4)}
+}};
+
+#endif // {guard}
+""")
+    return path
+
+
 def main() -> int:
     want = sys.argv[1:]
+    if len(want) == 1 and want[0].startswith("chain_"):
+        key = want[0].removeprefix("chain_")           # e.g. chain_fp8_64x64 -> fp8_64x64
+        if key not in BY_NAME:
+            raise SystemExit(f"unknown chain shape {key}; known: {sorted(k for k in BY_NAME)}")
+        shape = BY_NAME[key]
+        t0 = time.time()
+        print(f"matmul_fp8_{shape.M}x{shape.N}_chain.h  CHAIN C2=(A1@B1)@B2  "
+              f"M={shape.M} K={shape.K} N={shape.N} {FORMATS[shape.fmt].name}")
+        d = build_chain(shape)
+        p = emit_chain(shape, d)
+        print(f"  wrote {p.relative_to(HERE)}  ({time.time() - t0:.1f}s)\n")
+        return 0
     if want:
         unknown = [w for w in want if w not in BY_NAME]
         if unknown:
-            raise SystemExit(f"unknown shape(s) {unknown}; known: {sorted(BY_NAME)}")
+            raise SystemExit(f"unknown shape(s) {unknown}; known: {sorted(BY_NAME)} + chain_fp8_64x64")
         todo = [BY_NAME[w] for w in want]
     else:
         todo = SHAPES
