@@ -233,6 +233,18 @@ static acc_scale_t_bits acc_scale_t_to_acc_scale_t_bits(acc_scale_t x) {
    ((uint64_t)(scale_w_sel) << 61) | ((uint64_t)(scale_act_sel) << 60) |  ((uint64_t)(k_bound) << 51) | ((uint64_t)(j_bound) << 42) | ((uint64_t)(i_bound) << 33) | (uint64_t)(dram_addr), \
     (uint64_t)(lut_update_granularity) & 0xFFFF, CONFIG_SCALE_MEM)
 
+// C8.3 scale residency: identical to gemmini_mxquant_config_mvout but sets rs1 bit 62
+// (MX_SCALE_RESIDENT). Both Spike (mxquant_config_mvout handler) and RTL (ExecuteController
+// CONFIG_SCALE_MEM decode -> io.mx.scale_resident) read this bit and route the requantizer's
+// output activation block-scales into the on-chip act-scale window (transposed [GN][M]) so the
+// next matmul reads its A-scales in place -- no DRAM round-trip / SW reload. bit 62 is unused by
+// the plain macro (rs1 fields: dram 0-32, tiles_I 33-41, tiles_J 42-50, tiles_K 51-59,
+// scale_act_sel 60, scale_wgt_sel 61), so the default macro is bit-for-bit unchanged.
+#define gemmini_mxquant_config_mvout_resident(dram_addr, i_bound, j_bound, k_bound, scale_act_sel, scale_w_sel, lut_update_granularity) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, \
+   (1ULL << 63) | ((uint64_t)(scale_w_sel) << 61) | ((uint64_t)(scale_act_sel) << 60) |  ((uint64_t)(k_bound) << 51) | ((uint64_t)(j_bound) << 42) | ((uint64_t)(i_bound) << 33) | (uint64_t)(dram_addr), \
+    (uint64_t)(lut_update_granularity) & 0xFFFF, CONFIG_SCALE_MEM)
+
 #define gemmini_extended_mvin(dram_addr, spad_addr, cols, rows) \
   ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, dram_addr, ((uint64_t)(rows) << (ADDR_LEN + 16)) | ((uint64_t)(cols) << ADDR_LEN) | (spad_addr), k_MVIN)
 

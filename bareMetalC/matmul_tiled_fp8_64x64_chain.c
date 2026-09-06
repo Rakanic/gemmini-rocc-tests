@@ -34,6 +34,13 @@
 // (LoopMatmul/Scratchpad). Default 0 = flat (all existing requant tests unchanged).
 #define LOOP_WS_REQUANT_TILED (1u << 10)
 
+// C8: automatic scale residency (always on for the chain). MM1's requant writes C1's output
+// act-scales directly into the on-chip act-scale window (transposed [GN][M]) via
+// gemmini_mxquant_config_mvout_resident (MX_SCALE_RESIDENT = mxquant config rs1 bit 63), so MM2
+// reads its A-scales in place -- no DRAM buffer, no SW transpose/reload. Data + scales resident.
+#define CHAIN_FLAGS (0x38 | LOOP_WS_REQUANT_TILED)
+#define MXQUANT_CFG(...) gemmini_mxquant_config_mvout_resident(__VA_ARGS__)  // automatic resident scale reuse
+
 #define GEMMINI_CTRL 0x40084000
 #define GEMMINI_RS1_ADDR (GEMMINI_CTRL + 0x10)
 #define GEMMINI_RS2_ADDR (GEMMINI_CTRL + 0x18)
@@ -138,7 +145,7 @@ int main() {
     }
 
   gemmini_config_st(1 * sizeof(uint16_t));   // matches the passing requant test's store config
-  gemmini_mxquant_config_mvout((uint64_t)c1_scales, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  MXQUANT_CFG((uint64_t)c1_scales, tiles_I, tiles_J, tiles_K, 0, 0, 1);
 
   // V1 + reuse: requant FP8 output -> internal scratchpad at SPAD_DEST1, TILED (0x38 = requant-to-spad,
   // LOOP_WS_REQUANT_TILED = block-tiled operand layout so MM2 can read C1 in place).
@@ -154,7 +161,7 @@ int main() {
       NO_ACTIVATION,
       0, 0,
       false,
-      0x38 | LOOP_WS_REQUANT_TILED);
+      CHAIN_FLAGS);
   gemmini_fence();
 
   // ---- Residency readback: C1 is stored BLOCK-TILED (tile (i,nt) at SPAD_DEST1+(i*tiles_N+nt)*DIM,
@@ -209,21 +216,13 @@ int main() {
   uint32_t c2_scales[512] __attribute__((aligned(32))) = {0};
   memset(C2_hw, 0, sizeof(C2_hw));
 
-  // Reuse MM1's OUTPUT scales as MM2's A-scales. The requantizer wrote them to c1_scales in [M][GN]
-  // (row-major, m-major); the A-scale window wants [GK][M] (group-major, a_off = group*M + row), and
-  // for a square chain N1/32 == K2/32 so GN == GK. Transpose the scale bytes (tiny: GK*M = 128 B).
-  static uint8_t a2_scales[MATMUL_GK * MATMUL_M];
-  { uint8_t *sf1 = (uint8_t *) c1_scales;
-    for (int m = 0; m < MATMUL_M; m++)
-      for (int b = 0; b < MATMUL_GN; b++)
-        a2_scales[b * MATMUL_M + m] = sf1[m * MATMUL_GN + b]; }
+  // Reuse MM1's OUTPUT scales as MM2's A-scales.
 
 #if defined(SPIKE_SIM) || defined(MX_ROCKET)
-  gemmini_mx_load_scales((uint64_t)&a2_scales,      sizeof(a2_scales),      0);  // A = C1's reused scales
+  // SCALE_RESIDENT: MM1's requant already wrote C1's act-scales into the on-chip window -> no A load.
   gemmini_mx_load_scales((uint64_t)&B2_scales_col,  sizeof(B2_scales_col),  1);  // B = fresh B2 scales
   gemmini_fence();
 #else
-  load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, a2_scales, MATMUL_M, MATMUL_K);
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B2_scales_col, MATMUL_N, MATMUL_K);
 #endif
 
@@ -236,7 +235,7 @@ int main() {
     }
 
   gemmini_config_st(1 * sizeof(uint16_t));
-  gemmini_mxquant_config_mvout((uint64_t)c2_scales, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  MXQUANT_CFG((uint64_t)c2_scales, tiles_I, tiles_J, tiles_K, 0, 0, 1);
 
   // Operand A = C1 resident at SPAD_DEST1 (skip A mvin via 0x38); output C2 tiled at SPAD_DEST2.
   gemmini_loop_ws_spad(
@@ -251,7 +250,7 @@ int main() {
       NO_ACTIVATION,
       0, 0,
       false,
-      0x38 | LOOP_WS_REQUANT_TILED);
+      CHAIN_FLAGS);
   gemmini_fence();
 
   // ---- C2 readback (de-tile, same as C1) ----

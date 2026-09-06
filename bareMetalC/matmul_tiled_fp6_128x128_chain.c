@@ -28,6 +28,13 @@
 
 #define LOOP_WS_REQUANT_TILED (1u << 10)
 
+// C8: automatic scale residency (always on for the chain). MM1's requant writes C1's output
+// act-scales directly into the on-chip act-scale window (transposed [GN][M]) via
+// gemmini_mxquant_config_mvout_resident (MX_SCALE_RESIDENT = mxquant config rs1 bit 63), so MM2
+// reads its A-scales in place -- no DRAM buffer, no SW transpose/reload. Data + scales resident.
+#define CHAIN_FLAGS (0x38 | LOOP_WS_REQUANT_TILED)
+#define MXQUANT_CFG(...) gemmini_mxquant_config_mvout_resident(__VA_ARGS__)  // automatic resident scale reuse
+
 #define GEMMINI_CTRL 0x40084000
 #define GEMMINI_RS1_ADDR (GEMMINI_CTRL + 0x10)
 #define GEMMINI_RS2_ADDR (GEMMINI_CTRL + 0x18)
@@ -114,7 +121,6 @@ int main() {
 
   // ================= MM1: C1 = requant(A1 @ B1), stored TILED =================
   gemmini_config_st(1 * sizeof(uint64_t));
-  gemmini_mxquant_config_mvout((uint64_t)c1_scales, tiles_I, tiles_J, tiles_K, 0, 0, QUANT_LUT_UPDATE_GRANULARITY);
 
 #if defined(SPIKE_SIM) || defined(MX_ROCKET)
   gemmini_mx_load_lut((uint64_t)&B_lut[0][0], LUT_GROUPS_B, 0);   // weight
@@ -124,6 +130,9 @@ int main() {
   gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
   gemmini_fence();
 #endif
+  // MXQUANT_CFG sets scale_resident, which makes the Controller act-scale mux hold off
+  // scale_loader_act -> it MUST come AFTER MM1's A-scale load or that load hangs (the fp6 RTL bug).
+  MXQUANT_CFG((uint64_t)c1_scales, tiles_I, tiles_J, tiles_K, 0, 0, QUANT_LUT_UPDATE_GRANULARITY);
 
   // MVIN A1 (HW-tiled [M/2][K]): tile (i,k) -> a_base + (i*tiles_K + k)*DIM
   gemmini_config_ld(MATMUL_K * sizeof(uint8_t));
@@ -145,7 +154,7 @@ int main() {
   gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
                        a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST1,
                        false, false, false, false, false, NO_ACTIVATION, 0, 0, false,
-                       0x38 | LOOP_WS_REQUANT_TILED);
+                       CHAIN_FLAGS);
   gemmini_fence();
 
   mvout_detile((uint8_t *) C1_hw, SPAD_DEST1, MATMUL_M / 2, MATMUL_N);
@@ -163,20 +172,14 @@ int main() {
 
   // ================= MM2: C2 = requant(C1 @ B2), C1 read IN PLACE, LUT reused =================
   // MM2's activation-in LUT = MM1's OUTPUT LUT (C1_lut). Reuse c1_scales as A-scales ([M][GN]->[GK][M]).
-  static uint8_t a2_scales[MATMUL_GK * MATMUL_M];
-  { uint8_t *sf1 = (uint8_t *) c1_scales;
-    for (int m = 0; m < MATMUL_M; m++)
-      for (int b = 0; b < MATMUL_GN; b++)
-        a2_scales[b * MATMUL_M + m] = sf1[m * MATMUL_GN + b]; }
 
   gemmini_config_st(1 * sizeof(uint64_t));
-  gemmini_mxquant_config_mvout((uint64_t)c2_scales, tiles_I, tiles_J, tiles_K, 0, 0, QUANT_LUT_UPDATE_GRANULARITY);
+  MXQUANT_CFG((uint64_t)c2_scales, tiles_I, tiles_J, tiles_K, 0, 0, QUANT_LUT_UPDATE_GRANULARITY);
 
 #if defined(SPIKE_SIM) || defined(MX_ROCKET)
   gemmini_mx_load_lut((uint64_t)&B2_lut[0][0], LUT_GROUPS_B, 0);  // weight = B2
   gemmini_mx_load_lut((uint64_t)&C1_lut[0][0], LUT_GROUPS_A, 1);  // activation-in = MM1 output LUT (REUSED)
   gemmini_mx_load_lut((uint64_t)&C2_lut[0][0], LUT_GROUPS_A, 2);  // activation-out = C2 LUT
-  gemmini_mx_load_scales((uint64_t)&a2_scales,     sizeof(a2_scales),     0);
   gemmini_mx_load_scales((uint64_t)&B2_scales_col, sizeof(B2_scales_col), 1);
   gemmini_fence();
 #endif
@@ -193,7 +196,7 @@ int main() {
   gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
                        SPAD_DEST1, BANK_NUM * BANK_ROWS, 0, SPAD_DEST2,
                        false, false, false, false, false, NO_ACTIVATION, 0, 0, false,
-                       0x38 | LOOP_WS_REQUANT_TILED);
+                       CHAIN_FLAGS);
   gemmini_fence();
 
   mvout_detile((uint8_t *) C2_hw, SPAD_DEST2, MATMUL_M / 2, MATMUL_N);

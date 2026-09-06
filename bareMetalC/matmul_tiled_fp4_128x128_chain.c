@@ -28,6 +28,13 @@
 // LOOP_WS rs2 bit10: deposit requant->spad output BLOCK-TILED (operand layout) for in-place reuse.
 #define LOOP_WS_REQUANT_TILED (1u << 10)
 
+// C8: automatic scale residency (always on for the chain). MM1's requant writes C1's output
+// act-scales directly into the on-chip act-scale window (transposed [GN][M]) via
+// gemmini_mxquant_config_mvout_resident (MX_SCALE_RESIDENT = mxquant config rs1 bit 63), so MM2
+// reads its A-scales in place -- no DRAM buffer, no SW transpose/reload. Data + scales resident.
+#define CHAIN_FLAGS (0x38 | LOOP_WS_REQUANT_TILED)
+#define MXQUANT_CFG(...) gemmini_mxquant_config_mvout_resident(__VA_ARGS__)  // automatic resident scale reuse
+
 #define GEMMINI_CTRL 0x40084000
 #define GEMMINI_RS1_ADDR (GEMMINI_CTRL + 0x10)
 #define GEMMINI_RS2_ADDR (GEMMINI_CTRL + 0x18)
@@ -132,12 +139,12 @@ int main() {
                             b_base + (k * tiles_J + j) * DIM, DIM, DIM);
 
   gemmini_config_st(1 * sizeof(uint16_t));
-  gemmini_mxquant_config_mvout((uint64_t)c1_scales, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  MXQUANT_CFG((uint64_t)c1_scales, tiles_I, tiles_J, tiles_K, 0, 0, 1);
 
   gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
                        a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST1,
                        false, false, false, false, false, NO_ACTIVATION, 0, 0, false,
-                       0x38 | LOOP_WS_REQUANT_TILED);
+                       CHAIN_FLAGS);
   gemmini_fence();
 
   // Residency readback (de-tile) + checks. C1 packed layout is [M/2][N].
@@ -157,14 +164,8 @@ int main() {
   // ================= MM2: C2 = requant(C1 @ B2), C1 read IN PLACE =================
   // Reuse MM1's output block-scales as MM2's A-scales: c1_scales is [M][GN]; the A-scale window
   // wants [GK][M] (a_off = group*M + row), and N1/32 == K2/32 so GN == GK -> transpose (tiny).
-  static uint8_t a2_scales[MATMUL_GK * MATMUL_M];
-  { uint8_t *sf1 = (uint8_t *) c1_scales;
-    for (int m = 0; m < MATMUL_M; m++)
-      for (int b = 0; b < MATMUL_GN; b++)
-        a2_scales[b * MATMUL_M + m] = sf1[m * MATMUL_GN + b]; }
 
 #if defined(SPIKE_SIM) || defined(MX_ROCKET)
-  gemmini_mx_load_scales((uint64_t)&a2_scales,     sizeof(a2_scales),     0);  // A = C1's reused scales
   gemmini_mx_load_scales((uint64_t)&B2_scales_col, sizeof(B2_scales_col), 1);  // B = fresh B2 scales
   gemmini_fence();
 #endif
@@ -177,12 +178,12 @@ int main() {
                             b_base + (k * tiles_J + j) * DIM, DIM, DIM);
 
   gemmini_config_st(1 * sizeof(uint16_t));
-  gemmini_mxquant_config_mvout((uint64_t)c2_scales, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  MXQUANT_CFG((uint64_t)c2_scales, tiles_I, tiles_J, tiles_K, 0, 0, 1);
 
   gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
                        SPAD_DEST1, BANK_NUM * BANK_ROWS, 0, SPAD_DEST2,
                        false, false, false, false, false, NO_ACTIVATION, 0, 0, false,
-                       0x38 | LOOP_WS_REQUANT_TILED);
+                       CHAIN_FLAGS);
   gemmini_fence();
 
   mvout_detile((uint8_t *) C2_hw, SPAD_DEST2, MATMUL_M / 2, MATMUL_N);
