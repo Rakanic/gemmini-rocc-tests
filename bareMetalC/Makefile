@@ -75,6 +75,8 @@ mx_tests = \
 	matmul_tiled_fp4_128x128 \
 	matmul_tiled_fp4_128x128x512 \
 	matmul_tiled_fp8_64x64 \
+	matmul_tiled_fp8_e5m2_64x64 \
+	matmul_tiled_fp8_e5m2_64x64_requant \
 	matmul_tiled_fp8_64x64_DRAMMvout \
 	matmul_tiled_fp8_64x64_smem_mvout \
 	matmul_tiled_fp8_128x128 \
@@ -82,6 +84,8 @@ mx_tests = \
 	matmul_tiled_fp8_128x128x256_DRAMMvout \
 	matmul_tiled_fp8_64x64_requant \
 	matmul_tiled_fp8_64x64_chain \
+	llama_mlp \
+	llama_attention \
 	matmul_tiled_fp8_128x128_chain \
 	matmul_tiled_fp8_128x128_requant \
 	matmul_tiled_fp8_64x96x64 \
@@ -130,7 +134,7 @@ BENCH_COMMON = $(abs_top_srcdir)/riscv-tests/benchmarks/common
 # The matmul_*.h data headers are generated (gen_matmul_llama.py), so they must be prerequisites
 # too. Without them a regenerated golden leaves the ELF untouched and the test silently re-runs the
 # OLD data -- which still PASSES, because the stale header is self-consistent.
-GEMMINI_HEADERS = $(abs_top_srcdir)/include/gemmini.h $(abs_top_srcdir)/include/gemmini_params.h $(abs_top_srcdir)/include/gemmini_testutils.h $(wildcard $(abs_top_srcdir)/include/matmul_*.h)
+GEMMINI_HEADERS = $(abs_top_srcdir)/include/gemmini.h $(abs_top_srcdir)/include/gemmini_params.h $(abs_top_srcdir)/include/gemmini_testutils.h $(wildcard $(abs_top_srcdir)/include/matmul_*.h) $(wildcard $(abs_top_srcdir)/include/llama_*.h) $(abs_top_srcdir)/include/mx_host.h
 
 CFLAGS := $(CFLAGS) \
 	-DPREALLOCATE=1 \
@@ -159,6 +163,12 @@ CFLAGS_PK := \
 	$(CFLAGS) \
 	-static \
 	-DBAREMETAL=1 \
+
+# Appended AFTER the sources on the link line, which is where a library has to be to resolve
+# anything. The -lm inside CFLAGS above precedes them and so resolves nothing; llama_mlp needs
+# newlib's expf (SiLU), and mx_host.h supplies the __errno stub that -nostdlib leaves undefined.
+# Only tests that actually reference libm pull any of it in.
+LIBS := -lm
 
 CFLAGS_BAREMETAL := \
 	$(CFLAGS) \

@@ -66,7 +66,7 @@ SEED           = int(os.environ.get("MXGEMMINI_SEED", "0"))
 M              = int(os.environ.get("MXGEMMINI_M", "128"))
 K              = int(os.environ.get("MXGEMMINI_K", "512"))
 N              = int(os.environ.get("MXGEMMINI_N", "128"))
-INPUT_SPEC     = "fp6:e3m2"
+INPUT_SPEC     = os.environ.get("MXGEMMINI_INPUT_SPEC", "fp6:e3m2")
 LUT_INDEX_BITS = 4          # 2^4 = 16-entry LUT
 DEV            = torch.device("cpu")
 PROD_SPEC      = INPUT_SPEC  # product quantization spec (match hardware)
@@ -352,6 +352,34 @@ def fp6e3m2_nearest_finder(in_fp6: int, in_lut: list) -> int:
         if diffs[i] < diffs[min_idx]:
             min_idx = i
     return min_idx
+
+# ── Hardware-faithful FP8 E5M2 nearest-LUT finder (mirrors FP8NearestFinder.scala, altfmt=true) ──
+def fp8_e5m2_to_fixed_point(val: int) -> int:
+    val &= 0xFF
+    sign = (val >> 7) & 1
+    exp  = (val >> 2) & 0x1F
+    mant =  val       & 0x3
+    is_zero  = (exp == 0) and (mant == 0)
+    implicit = 0 if exp == 0 else 1
+    sig = (implicit << 2) | mant                   # 3 bits (sigW)
+    s_exp = (1 - 15) if exp == 0 else (exp - 15)   # minSExp = -14
+    shift_amt = (s_exp + 14) & 0x1F                # (s_exp + bias-1), shiftW = 5
+    shifted = (sig << shift_amt) & 0xFFFFFFFF       # fixedW = 32
+    signed = -shifted if sign else shifted
+    return 0 if is_zero else signed
+
+def fp8_e5m2_nearest_finder(in_code: int, in_lut: list) -> int:
+    assert len(in_lut) == 16, "LUT must have exactly 16 entries"
+    fixed_in  = fp8_e5m2_to_fixed_point(in_code)
+    fixed_lut = [fp8_e5m2_to_fixed_point(v) for v in in_lut]
+    diffs     = [abs(fixed_in - f) & 0x1FFFFFFFF for f in fixed_lut]  # 33-bit mask
+    min_idx   = 0
+    for i in range(1, 16):
+        if diffs[i] < diffs[min_idx]:
+            min_idx = i
+    return min_idx
+
+IS_E5M2 = (INPUT_SPEC == "fp8:e5m2")
 
 # Every 2^QUANT_LUT_UPDATE_GRANULARITY rows of A share one LUT; same for B cols
 G = QUANT_LUT_UPDATE_GRANULARITY
@@ -667,8 +695,13 @@ print(f"  quant_spec: {INPUT_SPEC}  scale_spec: {SCALE_SPEC}")
 # Hardware-accurate BF16 → fp6 conversion (matches BF16ScaleRoundToTiny + E4M2ToFp6)
 # The division by scale already happened in matrix_mx_requantize; snap to BF16 grid
 # then apply the two-stage HW pipeline: RNE→E4M2, E4M2→fp6.
-C_requantized = hw_bf16_to_fp6(q_bf16_rne(C_requantized))
-print(f"  Applied hw_bf16_to_fp6 (BF16 → E4M2 RNE → fp6:e3m2)")
+if IS_E5M2:
+    # E5M2 is a clean IEEE-like format: RNE-round the BF16 grid straight to the E5M2 grid.
+    C_requantized = make_fp_quantizer(INPUT_SPEC, rounding="nearest_even")(q_bf16_rne(C_requantized))
+    print(f"  Applied BF16 -> {INPUT_SPEC} (RNE)")
+else:
+    C_requantized = hw_bf16_to_fp6(q_bf16_rne(C_requantized))
+    print(f"  Applied hw_bf16_to_fp6 (BF16 → E4M2 RNE → fp6:e3m2)")
 
 # print(f"  C_requantized shape: {list(C_requantized.shape)}  C_req_scales shape: {list(C_req_scales.shape)}")
 # req_codes, req_bits = tensor_to_custom_fp_codes(C_requantized, INPUT_SPEC)
@@ -714,9 +747,12 @@ print("\n[Step 8]: project the quantized fp6 down to INT4 using C_luts")
 C_luts_t = torch.stack(C_luts)                                        # (M>>G, LUT_SIZE)
 C_luts_codes_raw, _ = tensor_to_custom_fp_codes(C_luts_t, INPUT_SPEC) # list[list[int]], 6-bit
 
-# Convert quantized C float values to 6-bit FP6 codes (subnormal-aware encoder)
-C_req_codes_raw = _fp6_tensor_to_codes(C_requantized.float().view(M, N))
-C_req_bits = 6
+# Convert quantized C float values to their raw codes (8-bit for E5M2, 6-bit for FP6)
+if IS_E5M2:
+    C_req_codes_raw, C_req_bits = tensor_to_custom_fp_codes(C_requantized.float().view(M, N), INPUT_SPEC)
+else:
+    C_req_codes_raw = _fp6_tensor_to_codes(C_requantized.float().view(M, N))
+    C_req_bits = 6
 
 # For element (m, n): LUT = C_luts[m >> G]  (M-dim row grouping, same as A_luts)
 # Find nearest LUT entry via fp6e3m2_nearest_finder and store 4-bit index
@@ -725,8 +761,8 @@ for m in range(M):
     lut_idx      = m >> G
     lut_codes    = C_luts_codes_raw[lut_idx]
     for n in range(N):
-        fp6_code     = C_req_codes_raw[m][n]
-        C_proj[m, n] = fp6e3m2_nearest_finder(fp6_code, lut_codes)
+        code_in      = C_req_codes_raw[m][n]
+        C_proj[m, n] = (fp8_e5m2_nearest_finder if IS_E5M2 else fp6e3m2_nearest_finder)(code_in, lut_codes)
 
 # ── Debug print for first NUM_PRINT_MGRP row-groups, showing first NUM_PRINT_COLS cols ──
 NUM_PRINT_MGRP = 2   # how many M-groups to show

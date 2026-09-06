@@ -315,14 +315,16 @@ def codes_to_hex_rows(codes: List[List[int]], total_bits: int) -> List[List[str]
     return [[f"{code:0{width}x}" for code in row] for row in codes]
 
 
-def pack_lut_hw_words(lut: list) -> list:
-    """Pack 16 6-bit LUT entries into 3 uint32_t words (HW-packed layout).
-    Mirrors the C load_lut() bit-packing logic."""
+def pack_lut_hw_words(lut: list, bits_per_entry: int = 6) -> list:
+    """Pack 16 entries of `bits_per_entry` bits into little-endian uint32 words (HW bitstream).
+    FP6 (6b) -> 3 words (96b); FP8 E5M2 (8b) -> 4 words (128b)."""
     assert len(lut) == 16
-    w0 = (lut[0] | (lut[1] << 6) | (lut[2] << 12) | (lut[3] << 18) | (lut[4] << 24) | (lut[5] << 30)) & 0xFFFFFFFF
-    w1 = ((lut[5] >> 2) | (lut[6] << 4) | (lut[7] << 10) | (lut[8] << 16) | (lut[9] << 22) | (lut[10] << 28)) & 0xFFFFFFFF
-    w2 = ((lut[10] >> 4) | (lut[11] << 2) | (lut[12] << 8) | (lut[13] << 14) | (lut[14] << 20) | (lut[15] << 26)) & 0xFFFFFFFF
-    return [w0, w1, w2]
+    nwords = (16 * bits_per_entry + 31) // 32
+    mask = (1 << bits_per_entry) - 1
+    stream = 0
+    for i, v in enumerate(lut):
+        stream |= (v & mask) << (i * bits_per_entry)
+    return [(stream >> (32 * w)) & 0xFFFFFFFF for w in range(nwords)]
 
 
 def _a_indices_to_hw_layout(indices, a_tile_m: int = 32, k_tile: int = 16) -> list:
@@ -410,10 +412,10 @@ def write_c_header_tiled_hw(
     def fmt2d_hex(hex_rows):
         return ",\n".join("    { " + ", ".join(f"0x{h}" for h in row) + " }" for row in hex_rows)
 
-    def fmt_lut_packed(lut_codes):
+    def fmt_lut_packed(lut_codes, bits_per_entry=6):
         lines = []
         for grp in lut_codes:
-            w = pack_lut_hw_words(grp)
+            w = pack_lut_hw_words(grp, bits_per_entry)
             lines.append("    { " + ", ".join(f"0x{x:08x}" for x in w) + " }")
         return ",\n".join(lines)
 
@@ -435,10 +437,13 @@ def write_c_header_tiled_hw(
 
         if lut_index_bits >= 0 and A_lut is not None:
             n_a, n_b, n_c = len(A_lut_codes), len(B_lut_codes), len(C_lut_codes)
-            f.write(f"// Lookup tables (HW-packed: 16x6-bit entries -> 3x uint32_t per group)\n")
-            f.write(f"static const uint32_t A_lut[{n_a}][3] = {{\n{fmt_lut_packed(A_lut_codes)}\n}};\n\n")
-            f.write(f"static const uint32_t B_lut[{n_b}][3] = {{\n{fmt_lut_packed(B_lut_codes)}\n}};\n\n")
-            f.write(f"static const uint32_t C_lut[{n_c}][3] = {{\n{fmt_lut_packed(C_lut_codes)}\n}};\n\n")
+            e_bits, m_bits = parse_fp_spec(input_spec)
+            lut_entry_bits = 1 + e_bits + m_bits           # fp6:e3m2 -> 6, fp8:e5m2 -> 8
+            lut_words = (16 * lut_entry_bits + 31) // 32     # 3 for fp6, 4 for e5m2
+            f.write(f"// Lookup tables (HW-packed: 16x{lut_entry_bits}-bit entries -> {lut_words}x uint32_t per group)\n")
+            f.write(f"static const uint32_t A_lut[{n_a}][{lut_words}] = {{\n{fmt_lut_packed(A_lut_codes, lut_entry_bits)}\n}};\n\n")
+            f.write(f"static const uint32_t B_lut[{n_b}][{lut_words}] = {{\n{fmt_lut_packed(B_lut_codes, lut_entry_bits)}\n}};\n\n")
+            f.write(f"static const uint32_t C_lut[{n_c}][{lut_words}] = {{\n{fmt_lut_packed(C_lut_codes, lut_entry_bits)}\n}};\n\n")
 
         f.write(f"// Per-row per-32-K-group scales in {scale_spec}\n")
         f.write(f"static const {c_type_for_bits(As_bits)} A_scales_row[MATMUL_GK][MATMUL_M] = {{\n{fmt2d_hex(As_hex)}\n}};\n\n")
