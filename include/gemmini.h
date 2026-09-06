@@ -65,12 +65,18 @@
 #define k_MX_READ_SMEM 28
 #define k_MX_LOAD_LUT  29
 
-// Load num_luts × (16 6-bit FP6 codes) from DRAM (3 LE uint32 per LUT).
-// sel: 0 = B (weight), 1 = A (activation), 2 = C (output)
-#define gemmini_mx_load_lut(dram_addr, num_luts, sel) \
+// Load num_luts LUT codebooks from DRAM. Each entry is `entry_bits` wide (the DATATYPE being loaded:
+// FP6/E2M3 = 6, FP8 E5M2 = 8); 16 entries per codebook, LE-packed. The HW unpacks this native codebook
+// into the accelerator's physical LUT slots, so the codebook packing is config-independent.
+//   rs2 = [39:34] entry_bits | [33:32] sel | [31:0] num_luts.  sel: 0=B(weight),1=A(act),2=C(output)
+#define gemmini_mx_load_lut_dt(dram_addr, num_luts, sel, entry_bits) \
   ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, (uint64_t)(dram_addr), \
-    ((uint64_t)(sel) << 32) | ((uint64_t)(num_luts) & 0xFFFFFFFFu), \
+    ((uint64_t)(entry_bits) << 34) | ((uint64_t)(sel) << 32) | ((uint64_t)(num_luts) & 0xFFFFFFFFu), \
     k_MX_LOAD_LUT)
+
+// Back-compat: the datatype defaults to FP6 (6-bit codes), so existing FP6 tests are unchanged.
+#define gemmini_mx_load_lut(dram_addr, num_luts, sel) \
+  gemmini_mx_load_lut_dt(dram_addr, num_luts, sel, 6)
 
 #define gemmini_mx_load_scales(dram_addr, len, sel) \
   ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, (uint64_t)(dram_addr), \

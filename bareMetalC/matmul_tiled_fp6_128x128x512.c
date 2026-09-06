@@ -145,9 +145,9 @@ int main() {
 #if defined(SPIKE_SIM) || defined(MX_ROCKET)
   // ISA parity: funct-29 LUTs + funct-27 scales (same calls as SPIKE_SIM), replacing the CPU
   // regmap + flat window. sel: LUT 0=weight(B),1=act-in(A),2=act-out(C); scales 0=A/act,1=B/wgt.
-  gemmini_mx_load_lut((uint64_t)&B_lut[0][0], (MATMUL_N >> QUANT_LUT_UPDATE_GRANULARITY), 0);
-  gemmini_mx_load_lut((uint64_t)&A_lut[0][0], (MATMUL_M >> QUANT_LUT_UPDATE_GRANULARITY), 1);
-  gemmini_mx_load_lut((uint64_t)&C_lut[0][0], (MATMUL_M >> QUANT_LUT_UPDATE_GRANULARITY), 2);
+  gemmini_mx_load_lut_dt((uint64_t)&B_lut[0][0], (MATMUL_N >> QUANT_LUT_UPDATE_GRANULARITY), 0, 6);
+  gemmini_mx_load_lut_dt((uint64_t)&A_lut[0][0], (MATMUL_M >> QUANT_LUT_UPDATE_GRANULARITY), 1, 6);
+  gemmini_mx_load_lut_dt((uint64_t)&C_lut[0][0], (MATMUL_M >> QUANT_LUT_UPDATE_GRANULARITY), 2, 6);
   gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
   gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
   gemmini_fence();

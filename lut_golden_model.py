@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import math
+import os
 import re
 import time
 from typing import Callable, Optional, Dict, Tuple, List
@@ -438,8 +439,11 @@ def write_c_header_tiled_hw(
         if lut_index_bits >= 0 and A_lut is not None:
             n_a, n_b, n_c = len(A_lut_codes), len(B_lut_codes), len(C_lut_codes)
             e_bits, m_bits = parse_fp_spec(input_spec)
-            lut_entry_bits = 1 + e_bits + m_bits           # fp6:e3m2 -> 6, fp8:e5m2 -> 8
-            lut_words = (16 * lut_entry_bits + 31) // 32     # 3 for fp6, 4 for e5m2
+            # LUT entries are packed at the format's NATIVE width (fp6:e3m2 -> 6b/96b, fp8:e5m2 -> 8b/128b).
+            # The HW LUT-load instruction carries the datatype and unpacks this native codebook into the
+            # accelerator's physical LUT slots, so the codebook packing is config-independent.
+            lut_entry_bits = 1 + e_bits + m_bits
+            lut_words = (16 * lut_entry_bits + 31) // 32     # 3 for fp6/6b, 4 for e5m2/8b
             f.write(f"// Lookup tables (HW-packed: 16x{lut_entry_bits}-bit entries -> {lut_words}x uint32_t per group)\n")
             f.write(f"static const uint32_t A_lut[{n_a}][{lut_words}] = {{\n{fmt_lut_packed(A_lut_codes, lut_entry_bits)}\n}};\n\n")
             f.write(f"static const uint32_t B_lut[{n_b}][{lut_words}] = {{\n{fmt_lut_packed(B_lut_codes, lut_entry_bits)}\n}};\n\n")

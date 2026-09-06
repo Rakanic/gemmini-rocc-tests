@@ -123,9 +123,9 @@ int main() {
   gemmini_config_st(1 * sizeof(uint64_t));
 
 #if defined(SPIKE_SIM) || defined(MX_ROCKET)
-  gemmini_mx_load_lut((uint64_t)&B_lut[0][0], LUT_GROUPS_B, 0);   // weight
-  gemmini_mx_load_lut((uint64_t)&A_lut[0][0], LUT_GROUPS_A, 1);   // activation-in
-  gemmini_mx_load_lut((uint64_t)&C1_lut[0][0], LUT_GROUPS_A, 2);  // activation-out
+  gemmini_mx_load_lut_dt((uint64_t)&B_lut[0][0], LUT_GROUPS_B, 0, 6);   // weight
+  gemmini_mx_load_lut_dt((uint64_t)&A_lut[0][0], LUT_GROUPS_A, 1, 6);   // activation-in
+  gemmini_mx_load_lut_dt((uint64_t)&C1_lut[0][0], LUT_GROUPS_A, 2, 6);  // activation-out
   gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
   gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
   gemmini_fence();
@@ -177,9 +177,9 @@ int main() {
   MXQUANT_CFG((uint64_t)c2_scales, tiles_I, tiles_J, tiles_K, 0, 0, QUANT_LUT_UPDATE_GRANULARITY);
 
 #if defined(SPIKE_SIM) || defined(MX_ROCKET)
-  gemmini_mx_load_lut((uint64_t)&B2_lut[0][0], LUT_GROUPS_B, 0);  // weight = B2
-  gemmini_mx_load_lut((uint64_t)&C1_lut[0][0], LUT_GROUPS_A, 1);  // activation-in = MM1 output LUT (REUSED)
-  gemmini_mx_load_lut((uint64_t)&C2_lut[0][0], LUT_GROUPS_A, 2);  // activation-out = C2 LUT
+  gemmini_mx_load_lut_dt((uint64_t)&B2_lut[0][0], LUT_GROUPS_B, 0, 6);  // weight = B2
+  gemmini_mx_load_lut_dt((uint64_t)&C1_lut[0][0], LUT_GROUPS_A, 1, 6);  // activation-in = MM1 output LUT (REUSED)
+  gemmini_mx_load_lut_dt((uint64_t)&C2_lut[0][0], LUT_GROUPS_A, 2, 6);  // activation-out = C2 LUT
   gemmini_mx_load_scales((uint64_t)&B2_scales_col, sizeof(B2_scales_col), 1);
   gemmini_fence();
 #endif
