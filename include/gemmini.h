@@ -64,6 +64,7 @@
 #define k_MX_LOAD_SCALES 27
 #define k_MX_READ_SMEM 28
 #define k_MX_LOAD_LUT  29
+#define k_MX_LUT_DISABLE 30
 
 // Load num_luts LUT codebooks from DRAM. Each entry is `entry_bits` wide (the DATATYPE being loaded:
 // FP6/E2M3 = 6, FP8 E5M2 = 8); 16 entries per codebook, LE-packed. The HW unpacks this native codebook
@@ -77,6 +78,10 @@
 // Back-compat: the datatype defaults to FP6 (6-bit codes), so existing FP6 tests are unchanged.
 #define gemmini_mx_load_lut(dram_addr, num_luts, sel) \
   gemmini_mx_load_lut_dt(dram_addr, num_luts, sel, 6)
+
+// Turn OFF runtime LUT usage for subsequent matmuls (MX_LOAD_LUT turns it back ON; default off).
+#define gemmini_mx_lut_disable() \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, 0, 0, k_MX_LUT_DISABLE)
 
 #define gemmini_mx_load_scales(dram_addr, len, sel) \
   ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, (uint64_t)(dram_addr), \

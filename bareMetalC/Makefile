@@ -77,6 +77,8 @@ mx_tests = \
 	matmul_tiled_fp8_64x64 \
 	matmul_tiled_fp8_e5m2_64x64 \
 	matmul_tiled_fp8_e5m2_64x64_requant \
+	matmul_tiled_fp8_e4m3_lut_64x64 \
+	matmul_tiled_fp6_e2m3_lut_64x64 \
 	matmul_tiled_fp8_64x64_DRAMMvout \
 	matmul_tiled_fp8_64x64_smem_mvout \
 	matmul_tiled_fp8_128x128 \

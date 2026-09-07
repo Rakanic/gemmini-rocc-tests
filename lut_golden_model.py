@@ -20,6 +20,7 @@ _FP_PRESETS = {
     "fp8:e4m3":  dict(exp=4, man=3),
     "fp8:e5m2":  dict(exp=5, man=2),
     "fp6:e3m2":  dict(exp=3, man=2),
+    "fp6:e2m3":  dict(exp=2, man=3),
     "fp4:e4m1":  dict(exp=2, man=1),
 
     # Experimental / custom

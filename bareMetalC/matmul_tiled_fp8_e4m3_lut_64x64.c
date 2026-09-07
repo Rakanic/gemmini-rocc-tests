@@ -1,8 +1,8 @@
-// FP8 E5M2 (via LUT) 64x64 matmul, BF16 output — standalone MxE5M2GemminiRocketConfig.
-// Mirrors the FP6 LUT test: operands are 4-bit LUT indices up-projected to the codebook, but the
-// codebook is 8-bit E5M2 (config_ex rs1[6] = mx_fp8_altfmt selects it in Spike; the RTL E5M2 build
-// specializes format code 1 to E5M2 at elaboration). Output is BF16 (out_mx_fmt=3), read back from
-// the internal scratchpad and compared against the golden C_out_bf16.
+// FP8 E4M3 at 4 elements/cycle (via LUT) 64x64 matmul, BF16 output — MxE4M3LutGemminiRocketConfig.
+// E4M3 stays format code 0 (FP8); the quad/LUT path is gated by lut_en, set by the mx_load_lut
+// instructions (G1). Operands are 4-bit LUT indices up-projected to the 8-bit E4M3 codebook, 2 per
+// operand lane, processed 4 elements/cycle by the 16-MACU mode9 PE. NO altfmt (E4M3, not E5M2).
+// Output is BF16 (out_mx_fmt=3), read back from the internal scratchpad and compared to C_out_bf16.
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -13,13 +13,13 @@
 #endif
 
 #include "include/gemmini_testutils.h"
-#include "include/matmul_data_mx_lut_e5m2_64x64.h"
+#include "include/matmul_data_mx_lut_e4m3_64x64.h"
 
 #define TILE 16
 #define DIM 16
 #define VALUES_PER_BYTE 2
 #define USE_LUT 1
-#define MX_ALTFMT 1                 // config_ex rs1[6]: LUT holds 8-bit E5M2 codes
+#define MX_ALTFMT 0                 // E4M3 (not E5M2): no altfmt
 #define QUANT_LUT_UPDATE_GRANULARITY 1
 #define ADDR_LEN 32
 #define BF16_PER_WORD 4
@@ -50,8 +50,8 @@ int main() {
       ((uint64_t)acc_scale_t_to_acc_scale_t_bits((acc_scale_t)ACC_SCALE_IDENTITY) << 32)
     | ((uint64_t)(1) << 16)         // A stride
     | ((uint64_t)(3) << 14)         // C (out) format = BF16
-    | ((uint64_t)(0) << 12)         // B (weight) format = fp8 (code0); altfmt=1 -> E5M2
-    | ((uint64_t)(0) << 10)         // A (activation) format = fp8 (code0); altfmt=1 -> E5M2
+    | ((uint64_t)(0) << 12)         // B (weight) format = FP8/E4M3 (code0); lut_en gates the quad+LUT path
+    | ((uint64_t)(0) << 10)         // A (activation) format = FP8/E4M3 (code0)
     | ((uint64_t)(0) << 9)          // B transpose
     | ((uint64_t)(0) << 8)          // A transpose
     | ((uint64_t)(0) << 7)          // set only strides
@@ -139,7 +139,7 @@ int main() {
     }
   }
 
-  if (errors == 0) printf("fp8 e5m2 WS matmul test PASSED (no mismatches).\n");
-  else             printf("fp8 e5m2 WS matmul test FAILED with %d mismatches.\n", errors);
+  if (errors == 0) printf("fp8 e4m3 (quad/LUT) WS matmul test PASSED (no mismatches).\n");
+  else             printf("fp8 e4m3 (quad/LUT) WS matmul test FAILED with %d mismatches.\n", errors);
   return errors == 0 ? 0 : 1;
 }
