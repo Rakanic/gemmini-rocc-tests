@@ -379,7 +379,30 @@ def fp8_e5m2_nearest_finder(in_code: int, in_lut: list) -> int:
             min_idx = i
     return min_idx
 
+# ── Hardware-faithful FP6 E2M3 nearest-LUT finder (E2M3 = exp2 man3 bias1) ──
+# Fixed-point = exact value * 8 (unit 2^-3): subnormal (exp field 0) -> mant; normal (field f>=1)
+# -> (8+mant) << (f-1). Matches mx_fp_math.h::fp6_e2m3_to_fixed_point and the RTL E2M3 finder.
+def fp6_e2m3_to_fixed_point(val: int) -> int:
+    val &= 0x3F
+    sign = (val >> 5) & 1
+    exp  = (val >> 3) & 0x3
+    mant =  val       & 0x7
+    mag = mant if exp == 0 else ((8 + mant) << (exp - 1))
+    return -mag if sign else mag
+
+def fp6e2m3_nearest_finder(in_code: int, in_lut: list) -> int:
+    assert len(in_lut) == 16, "LUT must have exactly 16 entries"
+    fixed_in  = fp6_e2m3_to_fixed_point(in_code)
+    fixed_lut = [fp6_e2m3_to_fixed_point(v) for v in in_lut]
+    diffs     = [abs(fixed_in - f) for f in fixed_lut]
+    min_idx   = 0
+    for i in range(1, 16):
+        if diffs[i] < diffs[min_idx]:
+            min_idx = i
+    return min_idx
+
 IS_E5M2 = (INPUT_SPEC == "fp8:e5m2")
+IS_E2M3 = (INPUT_SPEC == "fp6:e2m3")
 
 # Every 2^QUANT_LUT_UPDATE_GRANULARITY rows of A share one LUT; same for B cols
 G = QUANT_LUT_UPDATE_GRANULARITY
@@ -699,6 +722,11 @@ if IS_E5M2:
     # E5M2 is a clean IEEE-like format: RNE-round the BF16 grid straight to the E5M2 grid.
     C_requantized = make_fp_quantizer(INPUT_SPEC, rounding="nearest_even")(q_bf16_rne(C_requantized))
     print(f"  Applied BF16 -> {INPUT_SPEC} (RNE)")
+elif IS_E2M3:
+    # E2M3 (exp2 man3 bias1): snap the BF16 grid, then tensor_to_custom_fp_codes does the E2M3
+    # quantization+encode in Step 8 (RNE, subnormals, emax=1). Keep the BF16-snapped value here.
+    C_requantized = q_bf16_rne(C_requantized)
+    print(f"  Applied BF16 snap for {INPUT_SPEC} (E2M3 encode happens in Step 8)")
 else:
     C_requantized = hw_bf16_to_fp6(q_bf16_rne(C_requantized))
     print(f"  Applied hw_bf16_to_fp6 (BF16 → E4M2 RNE → fp6:e3m2)")
@@ -748,7 +776,8 @@ C_luts_t = torch.stack(C_luts)                                        # (M>>G, L
 C_luts_codes_raw, _ = tensor_to_custom_fp_codes(C_luts_t, INPUT_SPEC) # list[list[int]], 6-bit
 
 # Convert quantized C float values to their raw codes (8-bit for E5M2, 6-bit for FP6)
-if IS_E5M2:
+if IS_E5M2 or IS_E2M3:
+    # tensor_to_custom_fp_codes does the format-correct quantize+encode (E2M3: RNE, subnormals, emax=1).
     C_req_codes_raw, C_req_bits = tensor_to_custom_fp_codes(C_requantized.float().view(M, N), INPUT_SPEC)
 else:
     C_req_codes_raw = _fp6_tensor_to_codes(C_requantized.float().view(M, N))
@@ -762,7 +791,8 @@ for m in range(M):
     lut_codes    = C_luts_codes_raw[lut_idx]
     for n in range(N):
         code_in      = C_req_codes_raw[m][n]
-        C_proj[m, n] = (fp8_e5m2_nearest_finder if IS_E5M2 else fp6e3m2_nearest_finder)(code_in, lut_codes)
+        finder       = fp8_e5m2_nearest_finder if IS_E5M2 else (fp6e2m3_nearest_finder if IS_E2M3 else fp6e3m2_nearest_finder)
+        C_proj[m, n] = finder(code_in, lut_codes)
 
 # ── Debug print for first NUM_PRINT_MGRP row-groups, showing first NUM_PRINT_COLS cols ──
 NUM_PRINT_MGRP = 2   # how many M-groups to show

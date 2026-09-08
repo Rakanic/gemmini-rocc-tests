@@ -1,7 +1,7 @@
-// FP8 E5M2 (via LUT) 64x64 matmul, REQUANT output — standalone MxE5M2GemminiRocketConfig.
-// Same as the operand test, but the BF16 result is requantized to E5M2 4-bit LUT indices in the
-// scratchpad (this fires Amanda's FP8NearestFinder on the act-out projection). Reads the 4-bit
-// indices back and compares against the golden C_proj_hw (HW-tiled indices) + C_scales_row.
+// FP6 E2M3 (via LUT) 64x64 matmul, REQUANT output — symmetric encoding E2M3 = fp6/code1 + altfmt1.
+// Same as the operand test, but the BF16 result is requantized to E2M3 4-bit LUT indices in the
+// scratchpad (fires the E2M3 act-out projection). Reads the 4-bit indices back and compares against
+// the golden C_proj_hw (HW-tiled indices) + C_scales_row. E2M3 is 4-wide-via-LUT only.
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -12,13 +12,13 @@
 #endif
 
 #include "include/gemmini_testutils.h"
-#include "include/matmul_data_mx_lut_e5m2_64x64.h"
+#include "include/matmul_data_mx_lut_e2m3_64x64.h"
 
 #define TILE 16
 #define DIM 16
 #define VALUES_PER_BYTE 2
 #define USE_LUT 1
-#define MX_ALTFMT 1
+#define MX_ALTFMT 1                 // fp6 code1 + altfmt=1 -> E2M3
 #define QUANT_LUT_UPDATE_GRANULARITY 1
 #define ADDR_LEN 32
 
@@ -42,14 +42,14 @@ int main() {
   gemmini_extended_config_st(DIM * sizeof(out_t), NO_ACTIVATION, 1);
   gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, QUANT_LUT_UPDATE_GRANULARITY);
 
-  // config_ex: symmetric encoding — E5M2 = fp8/code0 + altfmt1. A/B/OUT format = 0 (fp8), altfmt=1,
-  // uselut (E5M2 is stored as 4-bit LUT indices and requant output is 4-bit LUT indices too).
+  // config_ex: symmetric encoding — E2M3 = fp6/code1 + altfmt1. A/B/OUT format = 1 (fp6), altfmt=1,
+  // uselut (E2M3 is stored as 4-bit LUT indices; requant output is 4-bit LUT indices too).
   ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC,
       ((uint64_t)acc_scale_t_to_acc_scale_t_bits((acc_scale_t)ACC_SCALE_IDENTITY) << 32)
     | ((uint64_t)(1) << 16)
-    | ((uint64_t)(0) << 14)         // C (out) format = 0 (fp8); altfmt1 selects E5M2 LUT
-    | ((uint64_t)(0) << 12)         // B format = 0 (fp8)
-    | ((uint64_t)(0) << 10)         // A format = 0 (fp8)
+    | ((uint64_t)(1) << 14)         // C (out) format = 1 (fp6); altfmt1 selects E2M3 LUT
+    | ((uint64_t)(1) << 12)         // B format = 1 (fp6)
+    | ((uint64_t)(1) << 10)         // A format = 1 (fp6)
     | ((uint64_t)(0) << 9)
     | ((uint64_t)(0) << 8)
     | ((uint64_t)(0) << 7)
@@ -61,9 +61,9 @@ int main() {
       ((uint64_t)(1) << 48) | (0),
       k_CONFIG);
 
-  gemmini_mx_load_lut_dt((uint64_t)&B_lut[0][0], (MATMUL_N >> QUANT_LUT_UPDATE_GRANULARITY), 0, 8);
-  gemmini_mx_load_lut_dt((uint64_t)&A_lut[0][0], (MATMUL_M >> QUANT_LUT_UPDATE_GRANULARITY), 1, 8);
-  gemmini_mx_load_lut_dt((uint64_t)&C_lut[0][0], (MATMUL_M >> QUANT_LUT_UPDATE_GRANULARITY), 2, 8);
+  gemmini_mx_load_lut_dt((uint64_t)&B_lut[0][0], (MATMUL_N >> QUANT_LUT_UPDATE_GRANULARITY), 0, 6);
+  gemmini_mx_load_lut_dt((uint64_t)&A_lut[0][0], (MATMUL_M >> QUANT_LUT_UPDATE_GRANULARITY), 1, 6);
+  gemmini_mx_load_lut_dt((uint64_t)&C_lut[0][0], (MATMUL_M >> QUANT_LUT_UPDATE_GRANULARITY), 2, 6);
   gemmini_mx_load_scales((uint64_t)&A_scales_row, sizeof(A_scales_row), 0);
   gemmini_mx_load_scales((uint64_t)&B_scales_col, sizeof(B_scales_col), 1);
   gemmini_fence();
@@ -93,7 +93,7 @@ int main() {
       false, false, false, false, false,
       NO_ACTIVATION, 0, 0, false, 0x38);
 
-  // Readback: E5M2 requant = 4-bit indices, 2/byte -> M*N/2 bytes -> M*N/2/DIM spad rows.
+  // Readback: E2M3 requant = 4-bit indices, 2/byte -> M*N/2 bytes -> M*N/2/DIM spad rows.
   gemmini_fence();
   gemmini_config_st(DIM * sizeof(uint8_t));
   uint8_t *c_base = (uint8_t *) C_hw;
@@ -134,8 +134,8 @@ int main() {
   }
 
   if (errors == 0 && scale_errors == 0)
-    printf("fp8 e5m2 requant test PASSED (no mismatches).\n");
+    printf("fp6 e2m3 requant test PASSED (no mismatches).\n");
   else
-    printf("fp8 e5m2 requant test FAILED: %d code, %d scale mismatches.\n", errors, scale_errors);
+    printf("fp6 e2m3 requant test FAILED: %d code, %d scale mismatches.\n", errors, scale_errors);
   return (errors == 0 && scale_errors == 0) ? 0 : 1;
 }

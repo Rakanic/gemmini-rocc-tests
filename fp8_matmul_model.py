@@ -473,6 +473,12 @@ def make_fp_quantizer(spec: str, rounding: str = "nearest") -> QuantFn:
         return None
     e, m = parse_fp_spec(spec)
     rounding = rounding.lower()
+    # E2M3 uses MxQuant's grid (emax=2, max_norm 7.5), which qtorch's float_quantize does NOT match
+    # (qtorch treats exp=2 as emax=1). Route ALL rounding modes for E2M3 through MxQuant so the codebook
+    # floats, operands (incl. the RTZ re-quant of gridded values) and requant all sit on the grid the
+    # hardware decodes. On already-gridded values this is a no-op; MxQuant nearest is the canonical grid.
+    if s == "fp6:e2m3" and rounding in ("nearest", "nearest_even", "zero", "toward_zero", "trunc", "rtz"):
+        return _mxquant_e2m3_quantizer()
     if rounding in ("nearest", "nearest_even", "stochastic"):
         from qtorch.quant import float_quantize
         mode = "nearest" if rounding in ("nearest", "nearest_even") else "stochastic"
@@ -480,6 +486,20 @@ def make_fp_quantizer(spec: str, rounding: str = "nearest") -> QuantFn:
     if rounding in ("zero", "toward_zero", "trunc", "rtz"):
         return lambda x: float_quantize_trunc(x, exp=e, man=m)
     raise ValueError(f"Unsupported rounding mode: {rounding}")
+
+
+def _mxquant_e2m3_quantizer():
+    """Return a callable that quantizes to MxQuant's fp6_e2m3 grid (emax=2, max_norm 7.5, subnormals
+    allowed, RNE, saturate) using MxQuant itself -- npu-exploration/MXQuant is the golden reference."""
+    import os, sys
+    _mxq = os.path.abspath(os.path.join(os.path.dirname(__file__),
+                                        "..", "..", "npu-exploration", "MXQuant", "microxcaling"))
+    if _mxq not in sys.path:
+        sys.path.insert(0, _mxq)
+    from mx.elemwise_ops import _quantize_elemwise
+    from mx.formats import ElemFormat
+    return lambda x: _quantize_elemwise(x, ElemFormat.fp6_e2m3, round='nearest',
+                                        saturate_normals=True, allow_denorm=True)
 
 def tensor_to_custom_fp_codes(t: Tensor, spec: str) -> Tuple[List[List[int]], int]:
     e_bits, m_bits = parse_fp_spec(spec)
@@ -501,7 +521,10 @@ def tensor_to_custom_fp_codes(t: Tensor, spec: str) -> Tuple[List[List[int]], in
     emin = 1 - bias
     # MX FP8 E4M3: biased_exp goes up to 15 (unbiased=8), NaN=0x7F only → pmax=448
     is_mx_fp8 = (e_bits == 4 and m_bits == 3)
-    emax = bias + 1 if is_mx_fp8 else bias
+    # MxQuant fp6_e2m3 uses emax = 2^(ebits-1) = 2 (max_norm 7.5), not bias=1. Match MxQuant
+    # (npu-exploration/MXQuant microxcaling formats.py) so E2M3 codes use exp field up to 3.
+    is_e2m3 = (e_bits == 2 and m_bits == 3)
+    emax = bias + 1 if (is_mx_fp8 or is_e2m3) else bias
     rows, cols = arr.shape
     out_codes: List[List[int]] = []
     for r in range(rows):

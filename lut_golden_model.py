@@ -209,6 +209,12 @@ def make_fp_quantizer(spec: str, rounding: str = "nearest") -> QuantFn:
     e, m = parse_fp_spec(spec)
     rounding = rounding.lower()
 
+    # E2M3 uses MxQuant's grid (emax=2, max_norm 7.5), which qtorch's float_quantize does not match.
+    # Route ALL rounding modes for E2M3 through MxQuant so make_lut's codebook floats and any RTZ
+    # re-quant of already-gridded values match the hardware decode (a no-op on gridded values).
+    if s == "fp6:e2m3" and rounding in ("nearest", "nearest_even", "zero", "toward_zero", "trunc", "rtz"):
+        return _mxquant_e2m3_quantizer()
+
     if rounding in ("nearest", "nearest_even", "stochastic"):
         from qtorch.quant import float_quantize
         mode = "nearest" if rounding in ("nearest", "nearest_even") else "stochastic"
@@ -218,6 +224,20 @@ def make_fp_quantizer(spec: str, rounding: str = "nearest") -> QuantFn:
         return lambda x: float_quantize_trunc(x, exp=e, man=m)
 
     raise ValueError(f"Unsupported rounding mode: {rounding}")
+
+
+def _mxquant_e2m3_quantizer():
+    """Quantize to MxQuant's fp6_e2m3 grid (emax=2, max_norm 7.5, subnormals, RNE, saturate) using
+    MxQuant itself -- npu-exploration/MXQuant is the golden reference."""
+    import os, sys
+    _mxq = os.path.abspath(os.path.join(os.path.dirname(__file__),
+                                        "..", "..", "npu-exploration", "MXQuant", "microxcaling"))
+    if _mxq not in sys.path:
+        sys.path.insert(0, _mxq)
+    from mx.elemwise_ops import _quantize_elemwise
+    from mx.formats import ElemFormat
+    return lambda x: _quantize_elemwise(x, ElemFormat.fp6_e2m3, round='nearest',
+                                        saturate_normals=True, allow_denorm=True)
 
 
 def make_lut(spec: str, index_bits: int, dev: torch.device, attempts: int = 1024) -> Tensor:
@@ -268,6 +288,11 @@ def tensor_to_custom_fp_codes(t: Tensor, spec: str) -> Tuple[List[List[int]], in
     bias = (1 << (e_bits - 1)) - 1
     emin = 1 - bias
     emax = bias
+    # MxQuant fp6_e2m3: emax = 2^(ebits-1) = 2 (max_norm 7.5), subnormals encoded (allow_denorm).
+    # Match MxQuant (npu-exploration/MXQuant) so header codebook == the golden finder's codebook.
+    is_e2m3 = (e_bits == 2 and m_bits == 3)
+    if is_e2m3:
+        emax = bias + 1
 
     arr = t.detach().cpu()
     if arr.ndim != 2:
@@ -286,7 +311,17 @@ def tensor_to_custom_fp_codes(t: Tensor, spec: str) -> Tuple[List[List[int]], in
                 av = abs(v)
                 E = math.floor(math.log2(av))
 
-                if E < emin:
+                if E < emin and is_e2m3:
+                    # E2M3 subnormal: quantum 2^(emin - m_bits) = 2^-3, round-half-to-even.
+                    quantum = 2.0 ** (emin - m_bits)
+                    k = int(round(av / quantum))
+                    if k <= 0:
+                        code = 0
+                    elif k >= 2 ** m_bits:
+                        code = (sign << (e_bits + m_bits)) | (1 << m_bits)   # -> min normal
+                    else:
+                        code = (sign << (e_bits + m_bits)) | k               # subnormal
+                elif E < emin:
                     code = 0
                 else:
                     if E > emax:
@@ -300,7 +335,15 @@ def tensor_to_custom_fp_codes(t: Tensor, spec: str) -> Tuple[List[List[int]], in
                         delta = base / (2 ** m_bits)
                         tpos = (av - base) / delta
                         mant = int(round(tpos))
-                        mant = max(0, min(mant, 2 ** m_bits - 1))
+                        if is_e2m3 and mant >= 2 ** m_bits:
+                            # MxQuant rounding carry (e.g. 3.9 -> 4.0): bump exponent, reset mantissa.
+                            E_used += 1
+                            mant = 0
+                            if E_used > emax:
+                                E_used = emax
+                                mant = (2 ** m_bits) - 1
+                        else:
+                            mant = max(0, min(mant, 2 ** m_bits - 1))
 
                     exp_bits_val = int(E_used + bias)
                     code = ((sign & 0x1) << (e_bits + m_bits)) | \
