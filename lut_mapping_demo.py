@@ -401,8 +401,77 @@ def fp6e2m3_nearest_finder(in_code: int, in_lut: list) -> int:
             min_idx = i
     return min_idx
 
+# ── Hardware-faithful FP8 E4M3 nearest-LUT finder (mirrors FP8NearestFinder.scala, altfmt=false) ──
+# bias=7, sigW=4, fixedW=18, shiftW=4. Smallest subnormal maps to 1. Matches mx_fp_math.h::
+# fp8_e4m3_to_fixed_point and the RTL E4M3 finder. Used for the E4M3-quad 4-bit-LUT requant output.
+def fp8_e4m3_to_fixed_point(val: int) -> int:
+    val &= 0xFF
+    sign = (val >> 7) & 1
+    exp  = (val >> 3) & 0xF
+    mant =  val       & 0x7
+    is_zero  = (exp == 0) and (mant == 0)
+    implicit = 0 if exp == 0 else 1
+    sig = (implicit << 3) | mant                   # 4 bits (sigW)
+    s_exp = (1 - 7) if exp == 0 else (exp - 7)     # minSExp = -6
+    shift_amt = (s_exp + 6) & 0xF                  # (s_exp + bias-1), shiftW = 4
+    shifted = (sig << shift_amt) & 0x3FFFF          # fixedW = 18
+    signed = -shifted if sign else shifted
+    return 0 if is_zero else signed
+
+def fp8_e4m3_nearest_finder(in_code: int, in_lut: list) -> int:
+    assert len(in_lut) == 16, "LUT must have exactly 16 entries"
+    fixed_in  = fp8_e4m3_to_fixed_point(in_code)
+    fixed_lut = [fp8_e4m3_to_fixed_point(v) for v in in_lut]
+    diffs     = [abs(fixed_in - f) & 0x7FFFF for f in fixed_lut]      # 19-bit mask (fixedW+1)
+    min_idx   = 0
+    for i in range(1, 16):
+        if diffs[i] < diffs[min_idx]:
+            min_idx = i
+    return min_idx
+
+# Round-half-away BF16->E4M3 8-bit encode. Mirrors mx_fp_math.h::fp8_e4m3_to_code + RTL BF16ToE4M3 +
+# MxQuant _round_mantissa(round="nearest") = sign*floor(|x|+0.5) (ties AWAY from zero). Used instead of
+# tensor_to_custom_fp_codes for the E4M3 requant codes, whose Python round() is ties-to-EVEN and mis-rounds
+# exact-half ties (the RTL/MxQuant round away), which showed up as a handful of nearest-index mismatches.
+def _rha(x: float) -> int:      # round-half-away for x >= 0
+    fl = _math.floor(x)
+    return int(fl) + (1 if (x - fl) >= 0.5 else 0)
+
+def bf16f_to_e4m3_code_rha(v: float) -> int:
+    if v == 0.0:
+        return 0
+    if not _math.isfinite(v):
+        return (0x80 if _math.copysign(1.0, v) < 0 else 0x00) | 0x7F
+    s  = 1 if _math.copysign(1.0, v) < 0 else 0
+    av = abs(v)
+    E  = _math.floor(_math.log2(av))
+    bias, emin, emax = 7, -6, 8
+    if E < emin:
+        quantum = 2.0 ** (emin - 3)          # 2^-9
+        k = _rha(av / quantum)
+        if k <= 0: return s << 7
+        if k >= 8: return (s << 7) | (1 << 3)
+        return (s << 7) | k
+    if E > emax:
+        E_used, mant = emax, 6
+    else:
+        E_used = E
+        base  = 2.0 ** E_used
+        delta = base / 8.0
+        k = _rha((av - base) / delta)
+        if k >= 8:
+            E_used += 1; k = 0
+            if E_used > emax: E_used, k = emax, 6
+        else:
+            hi = 6 if E_used == emax else 7
+            if k > hi: k = hi
+            if k < 0:  k = 0
+        mant = k
+    return (s << 7) | (((E_used + bias) & 0xF) << 3) | (mant & 0x7)
+
 IS_E5M2 = (INPUT_SPEC == "fp8:e5m2")
 IS_E2M3 = (INPUT_SPEC == "fp6:e2m3")
+IS_E4M3 = (INPUT_SPEC == "fp8:e4m3")
 
 # Every 2^QUANT_LUT_UPDATE_GRANULARITY rows of A share one LUT; same for B cols
 G = QUANT_LUT_UPDATE_GRANULARITY
@@ -722,6 +791,11 @@ if IS_E5M2:
     # E5M2 is a clean IEEE-like format: RNE-round the BF16 grid straight to the E5M2 grid.
     C_requantized = make_fp_quantizer(INPUT_SPEC, rounding="nearest_even")(q_bf16_rne(C_requantized))
     print(f"  Applied BF16 -> {INPUT_SPEC} (RNE)")
+elif IS_E4M3:
+    # E4M3-quad requant output: snap BF16 grid then quantize to the E4M3 grid. tensor_to_custom_fp_codes
+    # does the format-correct encode in Step 8; keep the BF16-snapped value here (mirrors E2M3).
+    C_requantized = q_bf16_rne(C_requantized)
+    print(f"  Applied BF16 snap for {INPUT_SPEC} (E4M3 encode happens in Step 8)")
 elif IS_E2M3:
     # E2M3 (exp2 man3 bias1): snap the BF16 grid, then tensor_to_custom_fp_codes does the E2M3
     # quantization+encode in Step 8 (RNE, subnormals, emax=1). Keep the BF16-snapped value here.
@@ -775,8 +849,15 @@ print("\n[Step 8]: project the quantized fp6 down to INT4 using C_luts")
 C_luts_t = torch.stack(C_luts)                                        # (M>>G, LUT_SIZE)
 C_luts_codes_raw, _ = tensor_to_custom_fp_codes(C_luts_t, INPUT_SPEC) # list[list[int]], 6-bit
 
-# Convert quantized C float values to their raw codes (8-bit for E5M2, 6-bit for FP6)
-if IS_E5M2 or IS_E2M3:
+# Convert quantized C float values to their raw codes (8-bit for E5M2/E4M3, 6-bit for FP6)
+if IS_E4M3:
+    # E4M3 requant codes MUST round ties AWAY (MxQuant "nearest" == RTL BF16ToE4M3 == Spike). Using
+    # tensor_to_custom_fp_codes here (Python round() ties-to-even) mis-rounds exact-half ties -> a few
+    # nearest-index mismatches vs HW. Encode with the round-half-away mirror instead.
+    Cf = C_requantized.float().view(M, N)
+    C_req_codes_raw = [[bf16f_to_e4m3_code_rha(float(Cf[m, n].item())) for n in range(N)] for m in range(M)]
+    C_req_bits = 8
+elif IS_E5M2 or IS_E2M3:
     # tensor_to_custom_fp_codes does the format-correct quantize+encode (E2M3: RNE, subnormals, emax=1).
     C_req_codes_raw, C_req_bits = tensor_to_custom_fp_codes(C_requantized.float().view(M, N), INPUT_SPEC)
 else:
@@ -791,7 +872,10 @@ for m in range(M):
     lut_codes    = C_luts_codes_raw[lut_idx]
     for n in range(N):
         code_in      = C_req_codes_raw[m][n]
-        finder       = fp8_e5m2_nearest_finder if IS_E5M2 else (fp6e2m3_nearest_finder if IS_E2M3 else fp6e3m2_nearest_finder)
+        finder       = (fp8_e5m2_nearest_finder if IS_E5M2 else
+                        fp8_e4m3_nearest_finder if IS_E4M3 else
+                        fp6e2m3_nearest_finder  if IS_E2M3 else
+                        fp6e3m2_nearest_finder)
         C_proj[m, n] = finder(code_in, lut_codes)
 
 # ── Debug print for first NUM_PRINT_MGRP row-groups, showing first NUM_PRINT_COLS cols ──
