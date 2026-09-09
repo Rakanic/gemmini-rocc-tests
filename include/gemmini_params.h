@@ -22,8 +22,8 @@ typedef uint64_t acc_t;
 typedef uint64_t full_t;
 
 #define ELEM_T_IS_FLOAT
-#define ELEM_T_EXP_BITS 4
-#define ELEM_T_SIG_BITS 4
+#define ELEM_T_EXP_BITS 2
+#define ELEM_T_SIG_BITS 2
 #define ACC_T_EXP_BITS 8
 #define ACC_T_SIG_BITS 8
 typedef uint8_t elem_t_bits;
