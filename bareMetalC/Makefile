@@ -109,6 +109,8 @@ mx_tests = \
 	matmul_tiled_asym_fp6_fp4_64x64 \
 	matmul_tiled_asym_e5m2_fp4_64x64 \
 	matmul_tiled_asym_fp4_e5m2_64x64 \
+	matmul_tiled_asym_e5m2_e3m2_64x64 \
+	matmul_tiled_asym_e3m2_e5m2_64x64 \
 
 # Pull the gate out of the generated header. Empty (tests stay int8-only) unless
 # the config built with use_mx_scaling=true.

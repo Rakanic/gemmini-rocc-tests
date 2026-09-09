@@ -26,8 +26,6 @@ fi
 
 cd build_mx_rocket
 
-if [[ $(which riscv64-unknown-linux-gnu-gcc) ]] ; then
-    make -j EXTRA_CFLAGS=-DMX_ROCKET $@
-else
-    make -j EXTRA_CFLAGS=-DMX_ROCKET BAREMETAL_ONLY=1 $@
-fi
+# The rocket/spike flow only consumes -baremetal binaries, so build those only. This also skips the
+# -linux/-pk variants of tests that don't link in this env (e.g. llama_mlp/llama_attention: expf, tohost_exit).
+make -j EXTRA_CFLAGS=-DMX_ROCKET BAREMETAL_ONLY=1 $@
