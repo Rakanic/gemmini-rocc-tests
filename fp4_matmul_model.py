@@ -813,8 +813,9 @@ def matrix_mx_requantize(matrix: Tensor, quant_spec: str = INPUT_SPEC):
     M, N = matrix.shape
     nblocks = N // GROUP
     e_bits, m_bits = parse_fp_spec(quant_spec)
-    emax = _fp_emax(e_bits, m_bits)  # correct for both FP4 E2M1 and FP8 E4M3
-    log2_pmax = emax                 # floor(log2(max_representable)) = emax
+    # Requant block-scale floor: p=0 for all formats -> output normalizes to [1,2) (chained-matmul
+    # fix). Matches the RTL/spike log2_pmax=0. (Previously subtracted emax=_fp_emax(e_bits,m_bits).)
+    log2_pmax = 0
 
     scale_q_fn = make_fp_quantizer(SCALE_SPEC, "nearest")
     C_quantized = torch.zeros_like(matrix)

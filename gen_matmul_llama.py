@@ -93,10 +93,12 @@ class Format:
     out_requant: str = "mxquant"
 
 FORMATS = {
+    # out_pmax=0 for every format now: the requant output normalizes to [1,2) (chained-matmul fix),
+    # matching the RTL/spike log2_pmax=0. FP8 was already 0 (MXQuant e2e); FP6/FP4 dropped 4/2.
     "fp8": Format("fp8:e4m3", "MXFP8_E4M3", 8, out_pmax=0),
-    "fp6": Format("fp6:e3m2", "MXFP6_E3M2", 6, out_pmax=4,
+    "fp6": Format("fp6:e3m2", "MXFP6_E3M2", 6, out_pmax=0,
                   tile_m=32, tile_n=32, model="fp4_matmul_model", out_requant="model"),
-    "fp4": Format("fp4:e2m1", "MXFP4", 4, out_pmax=2,
+    "fp4": Format("fp4:e2m1", "MXFP4", 4, out_pmax=0,
                   tile_m=32, tile_n=32, model="fp4_matmul_model", out_requant="model"),
 }
 

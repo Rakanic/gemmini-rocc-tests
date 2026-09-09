@@ -874,9 +874,9 @@ def matrix_mx_requantize(matrix, quant_spec=INPUT_SPEC):
     M, N = matrix.shape
     nblocks = N // GROUP
     e_bits, m_bits = parse_fp_spec(quant_spec)
-    # max_representable = 2^emax * (2 - 2^-m) = 2^8 * 1.75 = 448
-    emax = (1 << (e_bits - 1))  # = 8 for e4m3
-    log2_pmax = emax  # floor(log2(448)) = 8
+    # Requant block-scale floor: p=0 for all formats -> output normalizes to [1,2) (chained-matmul
+    # fix). Matches the RTL/spike log2_pmax=0. (Previously subtracted emax=(1<<(e_bits-1)).)
+    log2_pmax = 0
 
     scale_q_fn = make_fp_quantizer(SCALE_SPEC, "nearest")
 
