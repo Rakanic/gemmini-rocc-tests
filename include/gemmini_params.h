@@ -16,14 +16,14 @@
 
 typedef uint8_t elem_t;
 #define ELEM_T_IS_LOWPREC_FLOAT
-static const float elem_t_max = 4095;
+static const float elem_t_max = 65535;
 static const float elem_t_min = 0;
 typedef uint64_t acc_t;
 typedef uint64_t full_t;
 
 #define ELEM_T_IS_FLOAT
-#define ELEM_T_EXP_BITS 2
-#define ELEM_T_SIG_BITS 2
+#define ELEM_T_EXP_BITS 3
+#define ELEM_T_SIG_BITS 3
 #define ACC_T_EXP_BITS 8
 #define ACC_T_SIG_BITS 8
 typedef uint8_t elem_t_bits;
