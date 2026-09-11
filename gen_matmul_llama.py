@@ -51,7 +51,7 @@ sys.path.insert(0, str(HERE))
 
 import torch  # noqa: E402
 from app.mxq_golden import golden, MXQ_ROOT  # noqa: E402
-from app.mxquant import e8m0_decode  # noqa: E402
+from app.mxwire import e8m0_decode  # noqa: E402
 
 BLOCK = 32
 

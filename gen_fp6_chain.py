@@ -32,7 +32,7 @@ from fp8_matmul_model import tiled_matmul_hwlike, matrix_mx_requantize, make_fp_
 from lut_golden_model import (quantize_lut_indices, tensor_to_custom_fp_codes,             # noqa: E402
                               pack_lut_hw_words, _a_indices_to_hw_layout, q_bf16_rne)
 import llama_operands                                                                       # noqa: E402
-from app.mxquant import e8m0_decode                                                         # noqa: E402
+from app.mxwire import e8m0_decode                                                         # noqa: E402
 
 
 # --- fp6:e3m2 helpers, vendored VERBATIM from lut_mapping_demo.py (imported as functions here to
@@ -97,8 +97,28 @@ def _e4m2_to_fp6(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+_E3M2_Q = None
+def _e3m2_quantizer():
+    """MxQuant fp6_e3m2 grid, RNE (OCP round='even'), subnormals + saturate -- the golden reference
+    (matches RTL BF16ToE3M2 / mx_fp_math.h::bf16_bits_to_fp6_e3m2_code, verified 0/3328 vs spike)."""
+    global _E3M2_Q
+    if _E3M2_Q is None:
+        import os, sys
+        _mxq = os.path.abspath(os.path.join(os.path.dirname(__file__),
+                                            "..", "..", "npu-exploration", "MXQuant", "microxcaling"))
+        if _mxq not in sys.path:
+            sys.path.insert(0, _mxq)
+        from mx.elemwise_ops import _quantize_elemwise
+        from mx.formats import ElemFormat
+        _E3M2_Q = lambda x: _quantize_elemwise(x, ElemFormat.fp6_e3m2, round='even',
+                                               saturate_normals=True, allow_denorm=True)
+    return _E3M2_Q
+
+
 def hw_bf16_to_fp6(x: torch.Tensor) -> torch.Tensor:
-    return _e4m2_to_fp6(_bf16_to_e4m2_rne(x))
+    # Round STRAIGHT to the E3M2 grid, RNE (BF16 acc -> E3M2), replacing the old BF16->E4M2->fp6
+    # double-rounding path. The BF16 cast first matches the hardware's BF16 accumulator.
+    return _e3m2_quantizer()(x.to(torch.bfloat16).to(torch.float32))
 
 
 def _fp6_value_to_code(v: float) -> int:

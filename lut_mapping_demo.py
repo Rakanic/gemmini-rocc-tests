@@ -201,13 +201,28 @@ def _e4m2_to_fp6(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def hw_bf16_to_fp6(x: torch.Tensor) -> torch.Tensor:
-    """Hardware-accurate BF16 → fp6:e3m2, matching BF16ScaleRoundToTiny (fp6 path).
+_E3M2_Q = None
+def _e3m2_quantizer():
+    """MxQuant fp6_e3m2 grid, RNE (OCP round='even'), subnormals + saturate -- the golden reference
+    (matches RTL BF16ToE3M2 / mx_fp_math.h::bf16_bits_to_fp6_e3m2_code, verified 0/3328 vs spike)."""
+    global _E3M2_Q
+    if _E3M2_Q is None:
+        import os, sys
+        _mxq = os.path.abspath(os.path.join(os.path.dirname(__file__),
+                                            "..", "..", "npu-exploration", "MXQuant", "microxcaling"))
+        if _mxq not in sys.path:
+            sys.path.insert(0, _mxq)
+        from mx.elemwise_ops import _quantize_elemwise
+        from mx.formats import ElemFormat
+        _E3M2_Q = lambda x: _quantize_elemwise(x, ElemFormat.fp6_e3m2, round='even',
+                                               saturate_normals=True, allow_denorm=True)
+    return _E3M2_Q
 
-    1. RNE round BF16 bit-pattern to E4M2 (hardfloat RoundAnyRawFNToRecFN(8,8,4,3)).
-    2. Deterministic E4M2→fp6 re-encoding (E4M2ToFp6.scala).
-    """
-    return _e4m2_to_fp6(_bf16_to_e4m2_rne(x))
+
+def hw_bf16_to_fp6(x: torch.Tensor) -> torch.Tensor:
+    """Hardware-accurate BF16 -> fp6:e3m2: round STRAIGHT to the E3M2 grid, RNE (matches the rewritten
+    BF16ScaleRoundToTiny / BF16ToE3M2). Replaces the old BF16->E4M2->fp6 double-rounding path."""
+    return _e3m2_quantizer()(x.to(torch.bfloat16).to(torch.float32))
 
 
 def _fp6_value_to_code(v: float) -> int:
@@ -429,13 +444,14 @@ def fp8_e4m3_nearest_finder(in_code: int, in_lut: list) -> int:
             min_idx = i
     return min_idx
 
-# Round-half-away BF16->E4M3 8-bit encode. Mirrors mx_fp_math.h::fp8_e4m3_to_code + RTL BF16ToE4M3 +
-# MxQuant _round_mantissa(round="nearest") = sign*floor(|x|+0.5) (ties AWAY from zero). Used instead of
-# tensor_to_custom_fp_codes for the E4M3 requant codes, whose Python round() is ties-to-EVEN and mis-rounds
-# exact-half ties (the RTL/MxQuant round away), which showed up as a handful of nearest-index mismatches.
-def _rha(x: float) -> int:      # round-half-away for x >= 0
-    fl = _math.floor(x)
-    return int(fl) + (1 if (x - fl) >= 0.5 else 0)
+# BF16->E4M3 8-bit encode, RNE (OCP round='even'). Mirrors the rewritten mx_fp_math.h::fp8_e4m3_to_code
+# + RTL BF16ToE4M3 (2026-09-10: E4M3/E5M2 switched from half-away to RNE). Used instead of
+# tensor_to_custom_fp_codes for the E4M3 requant codes, which flushes subnormals.
+def _rne(x: float) -> int:      # round half to EVEN for x >= 0 (matches nearbyintf)
+    fl = int(_math.floor(x)); d = x - fl
+    if d < 0.5: return fl
+    if d > 0.5: return fl + 1
+    return fl if (fl % 2 == 0) else fl + 1
 
 def bf16f_to_e4m3_code_rha(v: float) -> int:
     if v == 0.0:
@@ -448,7 +464,7 @@ def bf16f_to_e4m3_code_rha(v: float) -> int:
     bias, emin, emax = 7, -6, 8
     if E < emin:
         quantum = 2.0 ** (emin - 3)          # 2^-9
-        k = _rha(av / quantum)
+        k = _rne(av / quantum)
         if k <= 0: return s << 7
         if k >= 8: return (s << 7) | (1 << 3)
         return (s << 7) | k
@@ -458,7 +474,7 @@ def bf16f_to_e4m3_code_rha(v: float) -> int:
         E_used = E
         base  = 2.0 ** E_used
         delta = base / 8.0
-        k = _rha((av - base) / delta)
+        k = _rne((av - base) / delta)
         if k >= 8:
             E_used += 1; k = 0
             if E_used > emax: E_used, k = emax, 6
@@ -480,7 +496,7 @@ if USE_LLAMA:
     # MX-quantize first (so every value is already a valid FP6 code), then reduce that codebook to
     # 16 signposts per LUT group -- MXQuant's level-2 scheme, see llama_operands.build_luts. The
     # block scales come from the same quantization instead of torch.randint.
-    from app.mxquant import e8m0_decode as _e8m0_decode
+    from app.mxwire import e8m0_decode as _e8m0_decode
     _cb = llama_operands.fp6_codebook()
     A_P, A_scale_codes = llama_operands.mx_quantize(A, axis="row")
     B_P, B_scale_codes = llama_operands.mx_quantize(B, axis="col")
@@ -788,9 +804,10 @@ print(f"  quant_spec: {INPUT_SPEC}  scale_spec: {SCALE_SPEC}")
 # The division by scale already happened in matrix_mx_requantize; snap to BF16 grid
 # then apply the two-stage HW pipeline: RNE→E4M2, E4M2→fp6.
 if IS_E5M2:
-    # E5M2 is a clean IEEE-like format: RNE-round the BF16 grid straight to the E5M2 grid.
-    C_requantized = make_fp_quantizer(INPUT_SPEC, rounding="nearest_even")(q_bf16_rne(C_requantized))
-    print(f"  Applied BF16 -> {INPUT_SPEC} (RNE)")
+    # E5M2: snap the BF16 grid; the format-correct RNE encode (matching mx_fp_math.h::bf16_bits_to_e5m2_code
+    # / RTL BF16ToE5M2, subnormals kept) happens at Step 8 via app.mxwire.encode_requant.
+    C_requantized = q_bf16_rne(C_requantized)
+    print(f"  Applied BF16 snap for {INPUT_SPEC} (E5M2 encode happens in Step 8)")
 elif IS_E4M3:
     # E4M3-quad requant output: snap BF16 grid then quantize to the E4M3 grid. tensor_to_custom_fp_codes
     # does the format-correct encode in Step 8; keep the BF16-snapped value here (mirrors E2M3).
@@ -857,7 +874,20 @@ if IS_E4M3:
     Cf = C_requantized.float().view(M, N)
     C_req_codes_raw = [[bf16f_to_e4m3_code_rha(float(Cf[m, n].item())) for n in range(N)] for m in range(M)]
     C_req_bits = 8
-elif IS_E5M2 or IS_E2M3:
+elif IS_E5M2:
+    # E5M2 requant codes: exact RNE encode via app.mxwire.encode_requant (= mx_fp_math.h
+    # bf16_bits_to_e5m2_code / RTL BF16ToE5M2, subnormals kept). tensor_to_custom_fp_codes would flush
+    # subnormals and mis-handle grid edges, giving a few nearest-index mismatches vs HW.
+    import os as _os, sys as _sys
+    _npu = _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..", "..", "npu-exploration"))
+    if _npu not in _sys.path:
+        _sys.path.insert(0, _npu)
+    from app.mxwire import encode_requant as _encode_requant
+    import numpy as _np
+    _Cf = C_requantized.float().view(M, N).detach().cpu().numpy().astype(_np.float32)
+    C_req_codes_raw = _encode_requant(_Cf, dtype="fp8_e5m2").astype(_np.uint8).tolist()
+    C_req_bits = 8
+elif IS_E2M3:
     # tensor_to_custom_fp_codes does the format-correct quantize+encode (E2M3: RNE, subnormals, emax=1).
     C_req_codes_raw, C_req_bits = tensor_to_custom_fp_codes(C_requantized.float().view(M, N), INPUT_SPEC)
 else:

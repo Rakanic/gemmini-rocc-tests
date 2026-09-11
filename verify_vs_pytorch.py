@@ -35,7 +35,7 @@ from gen_matmul_llama import (  # noqa: E402
     SHAPES, BY_NAME, FORMATS, build, load_pair, quantize, _decode_codes,
 )
 sys.path.insert(0, str(__import__("gen_matmul_llama").NPU))
-from app.mxquant import e8m0_decode  # noqa: E402
+from app.mxwire import e8m0_decode  # noqa: E402
 
 
 def dequant(codes: np.ndarray, scales: np.ndarray, *, axis: str, f, shape) -> np.ndarray:

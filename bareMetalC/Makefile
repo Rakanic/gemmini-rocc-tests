@@ -113,9 +113,13 @@ mx_tests = \
 	matmul_tiled_asym_e3m2_e5m2_64x64 \
 	matmul_tiled_asym_e4m3_fp4_64x64 \
 	matmul_tiled_asym_e4m3s_fp4_64x64 \
+	matmul_tiled_asym_e4m3s_fp4_16x32 \
+	matmul_tiled_asym_e4m3s_fp4_128x128 \
 	matmul_tiled_asym_e4m3s_e3m2_64x64 \
+	matmul_tiled_asym_e4m3s_e5m2_64x64 \
 	matmul_tiled_asym_fp4_e4m3s_64x64 \
 	matmul_tiled_asym_e3m2_e4m3s_64x64 \
+	matmul_tiled_asym_e5m2_e4m3s_64x64 \
 	matmul_tiled_asym_fp4_e4m3_64x64 \
 	matmul_tiled_asym_e5m2_e4m3_64x64 \
 	matmul_tiled_asym_e3m2_e4m3_64x64 \

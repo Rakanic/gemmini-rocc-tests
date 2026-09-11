@@ -50,7 +50,7 @@ sys.path.insert(0, str(HERE))
 import torch  # noqa: E402
 import gen_matmul_llama as G  # noqa: E402  -- PROD/ACC precision, quantize(), bf16_bits(), _rows()
 from app.capture_llama_layer import rmsnorm, silu  # noqa: E402  -- ONE definition of the host math
-from app.mxquant import e8m0_decode  # noqa: E402
+from app.mxwire import e8m0_decode  # noqa: E402
 
 CAPTURE = NPU / "out" / "layer_capture"
 FMT = G.FORMATS["fp8"]
