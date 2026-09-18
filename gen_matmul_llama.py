@@ -65,6 +65,14 @@ DATA_LEGACY = MXQ_ROOT / "end_to_end_linear" / "systolic_simulation" / "data_eva
 PROD_PRECISION = [(4, 3)] * 16
 ACC_PRECISION = [(4, 4)] * 8 + [(4, 5)] * 2 + [(4, 6)] * 5 + [(8, 7)] * 1
 
+def precision_for_dim(dim: int):
+    """Per-DIM (prod, acc) precision lists mirroring ConfigsFP dim{16,32}MxFPConfig
+    (Python frac = Scala sigWidth - 1): prod = MxFloat(4,4,4) uniform -> (4,3); acc = the DIM=16 ramp
+    for rows 0-15, extra rows (DIM>16) bf16 MxFloat(8,8,4) -> (8,7). dim=16 reproduces the originals."""
+    prod = [(4, 3)] * dim
+    acc = ACC_PRECISION[:dim] if dim <= 16 else ACC_PRECISION + [(8, 7)] * (dim - 16)
+    return prod, acc
+
 
 # --- formats -----------------------------------------------------------------------------------
 
@@ -116,6 +124,7 @@ class Shape:
     layer: str = "layer0"
     proj: str = "mlp.gate_proj"
     guard: str = ""
+    dim: int = 16               #: mesh DIM = per-tile accumulation depth (TILE); golden matches this DIM
     #: tests that consume this header, for the report
     tests: tuple[str, ...] = field(default_factory=tuple)
 
@@ -134,6 +143,9 @@ SHAPES = [
           guard="INCLUDE_MATMUL_FP8_64X64_H",
           tests=("matmul_tiled_fp8_64x64", "matmul_tiled_fp8_64x64_requant",
                  "matmul_tiled_fp8_64x64_DRAMMvout", "matmul_tiled_fp8_64x64_smem_mvout")),
+    Shape("matmul_fp8_64x64_dim32.h", 64, 64, 64, "fp8", dim=32,
+          guard="INCLUDE_MATMUL_FP8_64X64_DIM32_H",
+          tests=("matmul_tiled_fp8_64x64_requant_dim32",)),
     Shape("matmul_fp8_96x32x32.h", 96, 32, 32, "fp8", proj="mlp.up_proj",
           guard="INCLUDE_MATMUL_FP8_96X32X32_H",
           tests=("matmul_tiled_fp8_96x32x32", "matmul_tiled_fp8_96x32x32_requant")),
@@ -149,6 +161,13 @@ SHAPES = [
     Shape("matmul_fp8_128x128x256.h", 128, 256, 128, "fp8", layer="layer1",
           guard="INCLUDE_MATMUL_FP8_128X128X256_H",
           tests=("matmul_tiled_fp8_128x128x256", "matmul_tiled_fp8_128x128x256_DRAMMvout")),
+    Shape("matmul_fp8_128x128x256_dim32.h", 128, 256, 128, "fp8", dim=32, layer="layer1",
+          guard="INCLUDE_MATMUL_FP8_128X128X256_DIM32_H",
+          tests=("matmul_tiled_fp8_128x128x256_requant_dim32",)),
+    # Wide-N stress: N=256 = 8 col-tiles = 2 DIM=32 acc rows per output row (offsets 0/8/16/24 x2 rows).
+    Shape("matmul_fp8_64x256x64_dim32.h", 64, 64, 256, "fp8", dim=32, layer="layer1",
+          guard="INCLUDE_MATMUL_FP8_64X256X64_DIM32_H",
+          tests=("matmul_tiled_fp8_64x256x64_requant_dim32",)),
 
     Shape("matmul_fp4_64x64.h", 64, 64, 64, "fp4", layer="layer2",
           guard="MATMUL_DATA_FP4_H",
@@ -285,12 +304,14 @@ def build(shape: Shape, verbose: bool = True) -> dict[str, np.ndarray]:
     # The mesh model takes the code VALUES and the block scales separately, exactly as the
     # datapath does (raw code products accumulate first, scales apply afterwards).
     mm = __import__(f.model)
+    mm.TILE = shape.dim                                   # per-tile accumulation depth = mesh DIM
+    prod_prec, acc_prec = precision_for_dim(shape.dim)
     C_bf16 = mm.tiled_matmul_hwlike(
         torch.from_numpy(A_P), torch.from_numpy(B_P),
         torch.from_numpy(e8m0_decode(A_scales).astype(np.float32)),       # [M][GK]
         torch.from_numpy(e8m0_decode(B_scales).astype(np.float32)),       # [GK][N]
-        verbose=False, prod_precision_list=PROD_PRECISION,
-        acc_precision_list=ACC_PRECISION,
+        verbose=False, prod_precision_list=prod_prec,
+        acc_precision_list=acc_prec,
     ).numpy().astype(np.float32)
 
     if not np.isfinite(C_bf16).all():
