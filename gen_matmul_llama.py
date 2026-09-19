@@ -173,6 +173,19 @@ SHAPES = [
           guard="MATMUL_DATA_FP4_H",
           tests=("matmul_tiled_fp4_64x64", "matmul_tiled_fp4_64x64_requant",
                  "matmul_tiled_fp4_64x64_DRAMMvout")),
+    # FP4 on the 32x32 (DIM=32) mesh -- first wide-mesh nibble/quad-throughput requant test.
+    Shape("matmul_fp4_64x64_dim32.h", 64, 64, 64, "fp4", dim=32, layer="layer2",
+          guard="INCLUDE_MATMUL_FP4_64X64_DIM32_H",
+          tests=("matmul_tiled_fp4_64x64_requant_dim32",)),
+    # FP4 DIM=32, larger: 2 i-tiles x 2 j-tiles (GN=4, loop_bound_j=2), deeper K -- stresses multi-tile.
+    Shape("matmul_fp4_128x128_dim32.h", 128, 128, 128, "fp4", dim=32, layer="layer2",
+          guard="INCLUDE_MATMUL_FP4_128X128_DIM32_H",
+          tests=("matmul_tiled_fp4_128x128_requant_dim32",)),
+    # Same 2x2 output-tile shape but K=64 -> only 2 K-tiles (vs 4). Isolates the cross-K-tile accumulate
+    # as the fp4 128x128 residual trigger: if this passes on RTL, the bug scales with K-tile count.
+    Shape("matmul_fp4_128x128x64_dim32.h", 128, 64, 128, "fp4", dim=32, layer="layer2",
+          guard="INCLUDE_MATMUL_FP4_128X128X64_DIM32_H",
+          tests=("matmul_tiled_fp4_128x128x64_requant_dim32",)),
     Shape("matmul_fp4_128x128.h", 128, 128, 128, "fp4", layer="layer2", proj="mlp.up_proj",
           guard="INCLUDE_MATMUL_FP4_128X128_H",
           tests=("matmul_tiled_fp4_128x128", "matmul_tiled_fp4_128x128_requant")),
@@ -247,13 +260,15 @@ def quantize(V: np.ndarray, *, axis: str, f: Format, pmax_shift: int = 0):
         g = golden(V, axis=axis, fmt=f.mxq, pmax_shift=pmax_shift)
         return g.codes, g.scales, g.P
 
-    from app.mxq_golden import e8m0_encode_exact, _shift_scale
+    from app.mxq_golden import e8m0_encode_exact, _require_no_pmax_shift
     from end_to_end_linear.mx_block_quant import quantize_mx_block32
     model = __import__(f.model)
 
     out = quantize_mx_block32(torch.from_numpy(V), fmt=f.mxq, axis=axis)
-    if pmax_shift:
-        out = _shift_scale(V, out, fmt=f.mxq, axis=axis, pmax_shift=pmax_shift)
+    # _shift_scale was removed when the HW moved to log2_pmax=0 for every format; refuse a nonzero shift
+    # instead of silently ignoring it (mirrors the FP8/golden path). Every current out_pmax is 0, so this
+    # guard never fires -- it just replaces the dangling import that broke all nibble-format generation.
+    _require_no_pmax_shift(pmax_shift, f.mxq)
     P = out.P.numpy().astype(np.float32)
     scales = e8m0_encode_exact(out.X.numpy().astype(np.float32))
 
@@ -304,7 +319,14 @@ def build(shape: Shape, verbose: bool = True) -> dict[str, np.ndarray]:
     # The mesh model takes the code VALUES and the block scales separately, exactly as the
     # datapath does (raw code products accumulate first, scales apply afterwards).
     mm = __import__(f.model)
-    mm.TILE = shape.dim                                   # per-tile accumulation depth = mesh DIM
+    mm.TILE = shape.dim                                   # per-tile accumulation depth = mesh DIM (fp8 model)
+    # Nibble models (fp4) tile the quad output 2*DIM x 2*DIM with K-depth = DIM. The module ships the
+    # DIM=16 constants (32/32/16); rescale to the mesh DIM so dim=32 uses 64x64x32 (matches the
+    # prod/acc precision-list length = DIM asserted in matmul_outer_quantized_hwlike).
+    if hasattr(mm, "TILE_K"):
+        mm.TILE_K = shape.dim
+        mm.TILE_M = 2 * shape.dim
+        mm.TILE_N = 2 * shape.dim
     prod_prec, acc_prec = precision_for_dim(shape.dim)
     C_bf16 = mm.tiled_matmul_hwlike(
         torch.from_numpy(A_P), torch.from_numpy(B_P),

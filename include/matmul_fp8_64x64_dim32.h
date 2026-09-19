@@ -16,7 +16,8 @@
 #include <stdint.h>
 
 #define MATMUL_M 64
-#define MATMUL_K 64 #define MATMUL_N 64
+#define MATMUL_K 64
+#define MATMUL_N 64
 #define MATMUL_GK 2
 #define MATMUL_GN 2
 
