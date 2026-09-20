@@ -123,7 +123,10 @@ int main() {
     }
   }
 
-  int SPAD_DEST = 128;
+  // Output must land past the whole A region (a_base .. a_base+tiles_I*tiles_K*DIM); the old hardcoded
+  // 128 fit only the 64x64 baseline, so at 128x128/DIM=32 (A=256) it overwrote the i=1 activation
+  // mid-read. Compute it from the A footprint so it is DIM/size-robust.
+  int SPAD_DEST = a_base + tiles_I * tiles_K * DIM;
 
 #if defined(MX_ROCKET) || defined(SPIKE_SIM)
   gemmini_config_st(1 * sizeof(out_t));

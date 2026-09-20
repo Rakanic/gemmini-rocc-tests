@@ -101,7 +101,7 @@ int main() {
     }
   }
 
-  int SPAD_DEST = 128;
+  int SPAD_DEST = 256;
 
   gemmini_config_st(OUT_COLS * sizeof(out_t));
   gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
