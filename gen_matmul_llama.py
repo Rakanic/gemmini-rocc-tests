@@ -35,6 +35,7 @@ Run it with the npu-exploration venv, which has torch, ninja and the MXQuant rep
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -308,6 +309,29 @@ def build(shape: Shape, verbose: bool = True) -> dict[str, np.ndarray]:
     """Quantize, run the mesh model, requantize. Returns everything the header needs."""
     f = FORMATS[shape.fmt]
     A, B = load_pair(shape)
+    # DEBUG (env-gated): synthetic operands so the mesh output is a known function of position, making any
+    # waveform mis-read visible + traceable. Unit block scales fall out (block max is a power-of-2-friendly int).
+    if os.environ.get("GEMMINI_ONES"):
+        A = np.ones_like(A); B = np.ones_like(B)          # C[i][j] = K (uniform constant)
+        if verbose: print("  [GEMMINI_ONES] A,B all-ones -> C=K uniform")
+    elif os.environ.get("GEMMINI_COLENC"):
+        # C[i][j] = j+1 (distinct per COLUMN, uniform per row): A all-ones; B[k][j]=1 for k<=j else 0.
+        A = np.ones_like(A)
+        B = np.zeros_like(B)
+        K2, N_ = B.shape
+        for k in range(K2):
+            for j in range(N_):
+                if k <= j: B[k, j] = 1.0
+        if verbose: print("  [GEMMINI_COLENC] C[i][j]=j+1 (value == column index+1)")
+    elif os.environ.get("GEMMINI_ROWENC"):
+        # C[i][j] = i+1 (distinct per ROW, uniform per col): B all-ones; A[i][k]=1 for k<=i else 0.
+        B = np.ones_like(B)
+        A = np.zeros_like(A)
+        M_, K_ = A.shape
+        for i in range(M_):
+            for k in range(K_):
+                if k <= i: A[i, k] = 1.0
+        if verbose: print("  [GEMMINI_ROWENC] C[i][j]=i+1 (value == row index+1)")
     if verbose:
         print(f"  operands {shape.layer}/{shape.proj}  A{A.shape} |max|={np.abs(A).max():.6g}  "
               f"B{B.shape} |max|={np.abs(B).max():.6g}")
@@ -315,6 +339,33 @@ def build(shape: Shape, verbose: bool = True) -> dict[str, np.ndarray]:
     # A is blocked along K (its columns); B along K (its rows).
     A_codes, A_scales, A_P = quantize(A, axis="row", f=f)     # scales [M][GK]
     B_codes, B_scales, B_P = quantize(B, axis="col", f=f)     # scales [GK][N]
+
+    # DEBUG (env-gated): keep the REAL (varied) operand codes but force all block scales to unit (E8M0 127),
+    # so the acc = raw code products (no scale applied). Isolates whether the scale path is involved.
+    if os.environ.get("GEMMINI_NOSCALE"):
+        A_scales = np.full_like(A_scales, 127)
+        B_scales = np.full_like(B_scales, 127)
+        if verbose: print("  [GEMMINI_NOSCALE] real codes, block scales forced to unit (E8M0 127)")
+    elif os.environ.get("GEMMINI_AROWENC"):
+        # real codes; A (row/act) scale encodes row%8 (distinct within each 8-row group), B scale unit.
+        # A row0/row1 scale swap or period-8 mis-association shows as a distinct wrong value + which row.
+        for i in range(A_scales.shape[0]):
+            A_scales[i, :] = 120 + (i % 8)
+        B_scales = np.full_like(B_scales, 127)
+        if verbose: print("  [GEMMINI_AROWENC] A-scale=120+(row%8), B-scale unit")
+    elif os.environ.get("GEMMINI_BCOLENC"):
+        # real codes; B (col/weight) scale encodes col%8, A scale unit. Isolates a column-scale mis-index.
+        for j in range(B_scales.shape[1]):
+            B_scales[:, j] = 120 + (j % 8)
+        A_scales = np.full_like(A_scales, 127)
+        if verbose: print("  [GEMMINI_BCOLENC] B-scale=120+(col%8), A-scale unit")
+    elif os.environ.get("GEMMINI_UNIFSCALE"):
+        # real codes, but ALL block scales the same non-unit value (E8M0 128 = 2.0). Distinguishes a
+        # scale-index/ordering bug (uniform scale -> wrong index reads same value -> passes) from a
+        # magnitude/exponent bug (still fails).
+        A_scales = np.full_like(A_scales, 128)
+        B_scales = np.full_like(B_scales, 128)
+        if verbose: print("  [GEMMINI_UNIFSCALE] real codes, all block scales = E8M0 128 (2.0), uniform")
 
     # The mesh model takes the code VALUES and the block scales separately, exactly as the
     # datapath does (raw code products accumulate first, scales apply afterwards).
