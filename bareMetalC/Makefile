@@ -95,6 +95,11 @@ mx_tests = \
 	matmul_tiled_fp4_64x64_nonrequant_dim32 \
 	matmul_tiled_fp4_128x128_nonrequant_dim32 \
 	matmul_tiled_fp4_128x128x64_requant_dim32 \
+	matmul_tiled_fp8_e4m3_lut_64x64_requant_dim32 \
+	matmul_tiled_fp8_e4m3_lut_64x64_dim32 \
+	matmul_tiled_fp8_e5m2_64x64_requant_dim32 \
+	matmul_tiled_fp6_e2m3_lut_64x64_requant_dim32 \
+	matmul_tiled_fp6_e3m2_lut_64x64_requant_dim32 \
 	matmul_tiled_fp8_64x64_chain \
 	matmul_tiled_fp8_128x128_chain \
 	matmul_tiled_fp8_128x128_requant \
