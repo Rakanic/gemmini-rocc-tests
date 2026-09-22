@@ -100,6 +100,43 @@ mx_tests = \
 	matmul_tiled_fp8_e5m2_64x64_requant_dim32 \
 	matmul_tiled_fp6_e2m3_lut_64x64_requant_dim32 \
 	matmul_tiled_fp6_e3m2_lut_64x64_requant_dim32 \
+	matmul_tiled_fp8_e4m3_lut_128x128_requant_dim32 \
+	matmul_tiled_fp8_e5m2_128x128_requant_dim32 \
+	matmul_tiled_fp6_e2m3_lut_128x128_requant_dim32 \
+	matmul_tiled_fp6_e3m2_lut_128x128_requant_dim32 \
+	matmul_tiled_fp8_e4m3_lut_128x64x128_requant_dim32 \
+	matmul_tiled_fp8_e4m3_lut_64x128x128_requant_dim32 \
+	matmul_tiled_fp8_e5m2_128x64x128_requant_dim32 \
+	matmul_tiled_fp8_e5m2_64x128x128_requant_dim32 \
+	matmul_tiled_fp6_e2m3_lut_128x64x128_requant_dim32 \
+	matmul_tiled_fp6_e2m3_lut_64x128x128_requant_dim32 \
+	matmul_tiled_fp6_e3m2_lut_128x64x128_requant_dim32 \
+	matmul_tiled_fp6_e3m2_lut_64x128x128_requant_dim32 \
+	matmul_tiled_asym_fp4_fp6_64x64_dim32 \
+	matmul_tiled_asym_e2m3_e3m2_64x64_dim32 \
+	matmul_tiled_asym_e2m3_e5m2_64x64_dim32 \
+	matmul_tiled_asym_e2m3_fp4_64x64_dim32 \
+	matmul_tiled_asym_e3m2_e2m3_64x64_dim32 \
+	matmul_tiled_asym_e3m2_e5m2_64x64_dim32 \
+	matmul_tiled_asym_e4m3_e2m3_64x64_dim32 \
+	matmul_tiled_asym_e4m3_e3m2_64x64_dim32 \
+	matmul_tiled_asym_e4m3_e5m2_64x64_dim32 \
+	matmul_tiled_asym_e4m3_fp4_64x64_dim32 \
+	matmul_tiled_asym_e5m2_e2m3_64x64_dim32 \
+	matmul_tiled_asym_e5m2_e3m2_64x64_dim32 \
+	matmul_tiled_asym_e5m2_e4m3_64x64_dim32 \
+	matmul_tiled_asym_e5m2_fp4_64x64_dim32 \
+	matmul_tiled_asym_fp4_e2m3_64x64_dim32 \
+	matmul_tiled_asym_fp4_e5m2_64x64_dim32 \
+	matmul_tiled_asym_e5m2_e4m3s_64x64_dim32 \
+	matmul_tiled_asym_e4m3s_e3m2_64x64_dim32 \
+	matmul_tiled_asym_e4m3s_e5m2_64x64_dim32 \
+	matmul_tiled_asym_e4m3s_fp4_64x64_dim32 \
+	matmul_tiled_asym_fp6_fp4_64x64_dim32 \
+	matmul_tiled_asym_fp4_fp6_128x128x256_dim32 \
+	matmul_tiled_asym_e2m3_e5m2_128x128x256_dim32 \
+	matmul_tiled_asym_e4m3s_fp4_128x128x256_dim32 \
+	matmul_tiled_asym_e4m3s_e5m2_128x128x256_dim32 \
 	matmul_tiled_fp8_64x64_chain \
 	matmul_tiled_fp8_128x128_chain \
 	matmul_tiled_fp8_128x128_requant \
