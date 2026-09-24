@@ -162,6 +162,122 @@ def _rne_general(x: Tensor, exp_bits: int, man_bits: int) -> Tensor:
     out[finite_nz] = sign_all[finite_nz] * result
     return out
 
+#: Set truthy to force the scalar reference paths for fp_quantize_rne / fp_add_exact. The vectorized
+#: implementations below are gated against these element-for-element by test_vector_primitives.py;
+#: this switch exists so that test can obtain the reference, and as an escape hatch.
+#: A plain module attribute, not an env lookup: this region is EXTRACTED verbatim into
+#: npu-exploration/app/mxmesh/fp8.py, whose preamble does not import os.
+_FORCE_SCALAR_PRIMITIVES = False
+
+#: Below this many elements the scalar path wins: torch's per-op dispatch dominates, and these
+#: primitives issue ~20 ops. THIS THRESHOLD IS NOT COSMETIC -- the two consumers sit on opposite
+#: sides of it. MEASURED single-threaded at (e4,m4), vectorized vs scalar throughput:
+#:
+#:     n=256  1.02x | n=1024  3.19x | n=4096  8.46x | n=16384+  11-14x
+#:
+#: `tiled_matmul_hwlike` (the kernel goldens) works per DIM-tile, so n = 16*16 = 256 and it lands
+#: exactly on the neutral point -- switching it wholesale measured SLOWER end to end (_run_mesh
+#: 1.73s vs 1.55s). `MXLinearSim` (rtl_exact, the perplexity path) works on the full [M][N] and is
+#: the case this vectorization exists for. Dispatching on size gives each what it wants.
+_VEC_MIN_ELEMS = 1024
+
+
+def _rne_shift_vec(n: Tensor, sh) -> Tensor:
+    """RNE(n / 2**sh) on integer tensors -- the vector form of _round_div_pow2_rne_int.
+
+    Preserves `n`'s dtype (int32 suffices for the quantizer, where |n| < 2**24; the adder needs
+    int64 for its aligned significands). `sh` may be an int or an integer tensor, and may be
+    negative (a left shift, which is exact). Right shifts are clamped to the dtype width: every
+    caller passes |n| < 2**24, so any shift past 25 yields q = 0 with rem = n < half and therefore
+    0, exactly as the unclamped scalar does -- the clamp only avoids integer shift UB.
+    """
+    lim = 30 if n.dtype == torch.int32 else 62
+    if not torch.is_tensor(sh):
+        sh = torch.full_like(n, int(sh))
+    sh = sh.to(n.dtype)
+    left = sh <= 0
+    q_left = n << (-sh).clamp(min=0, max=lim)
+    s = sh.clamp(min=1, max=lim)
+    q = n >> s
+    one = torch.ones_like(n)
+    rem = n & ((one << s) - 1)
+    half = one << (s - 1)
+    up = (rem > half) | ((rem == half) & ((q & 1) != 0))
+    return torch.where(left, q_left, q + up.to(n.dtype))
+
+
+def _rne_vec(x: Tensor, exp_bits: int, man_bits: int,
+             overflow_to_inf: bool = True) -> Tensor:
+    """Vectorized `fp_quantize_rne_scalar`: IEEE-like RNE to (exp_bits, man_bits).
+
+    Subnormals preserved, overflow to +-inf, NaN/inf propagated, signed zero preserved. Mirrors
+    `_round_dyadic_to_scalar` branch for branch, on int64 significands: a float32 is itself a dyadic
+    rational, so `frexp` gives the exact (num, exp2) that `as_integer_ratio` gives up to trailing
+    zeros -- and RNE of an exact value does not depend on that normalization.
+
+    NOT the same function as the (unused) `_rne_general` above, which rounds differently.
+    """
+    x = x.float()
+    sign = torch.signbit(x)
+    ax = x.abs()
+    nan = torch.isnan(x)
+    inf = torch.isinf(x)
+    zero = ax == 0
+    special = nan | inf | zero
+
+    bias = (1 << (exp_bits - 1)) - 1
+    emin, emax = 1 - bias, bias
+
+    # frexp is undefined on nan/inf; feed it a harmless value there and discard the result.
+    safe = torch.where(special, torch.ones_like(ax), ax)
+    m_f, e_i = torch.frexp(safe)
+    # INT32 THROUGHOUT, and the scaling is exact in float32: m_f has 24 mantissa bits and 2**24 is
+    # a power of two, so the product is an integer in [2**23, 2**24) that float32 represents
+    # exactly. Using int64/float64 here doubles every temporary and, at [2048,2048], walks off the
+    # cache -- measured 173 Melem/s at 1M elements against 7.6 at 4M before this.
+    num = (m_f * float(1 << 24)).to(torch.int32)
+    exp2 = e_i.to(torch.int32) - 24
+    P = 23
+    E = exp2 + P
+
+    # --- normal: E >= emin ---
+    tot_n = _rne_shift_vec(num, P - man_bits)
+    carry_n = tot_n >= (1 << (man_bits + 1))
+    tot_n = torch.where(carry_n, tot_n >> 1, tot_n)
+    E_n = torch.where(carry_n, E + 1, E)
+
+    # --- subnormal: E < emin. sh > 0 here, so no left shift arises on the taken branch. ---
+    sh_s = (emin - man_bits) - exp2
+    sub = _rne_shift_vec(num, sh_s)
+    promoted = sub >= (1 << man_bits)            # rounding lifted it into the normal range
+    tot_p = torch.where(sub >= (1 << (man_bits + 1)), sub >> 1, sub)
+    E_p = torch.where(sub >= (1 << (man_bits + 1)),
+                      torch.full_like(E, emin + 1), torch.full_like(E, emin))
+
+    is_sub = E < emin
+    sig = torch.where(is_sub, torch.where(promoted, tot_p, sub), tot_n)
+    ex = torch.where(is_sub,
+                     torch.where(promoted, E_p - man_bits,
+                                 torch.full_like(E, emin - man_bits)),
+                     E_n - man_bits)
+    overflow = torch.where(is_sub, promoted & (E_p > emax), E_n > emax)
+
+    val = torch.ldexp(sig.to(torch.float32), ex.to(torch.int32))
+    if overflow_to_inf:
+        val = torch.where(overflow, torch.full_like(val, float("inf")), val)
+    out = torch.where(sign, -val, val)
+
+    # UNDERFLOW IS UNSIGNED. `_round_dyadic_to_scalar` returns a literal 0.0 when the rounded
+    # subnormal significand is zero, discarding the sign -- so a negative value that underflows
+    # becomes +0.0, NOT -0.0. This must be applied AFTER the sign, and it is deliberately not the
+    # same as an input of -0.0, which the `x == 0.0: return x` branch passes through with its sign.
+    out = torch.where(is_sub & (sub == 0), torch.zeros_like(out), out)
+
+    out = torch.where(zero, x, out)                                   # preserves -0.0
+    out = torch.where(inf, x, out)
+    return torch.where(nan, torch.full_like(out, float("nan")), out)
+
+
 def fp_quantize_rne(x: Tensor, exp_bits: int, man_bits: int) -> Tensor:
     """Unified FP quantizer with round-to-nearest-even.
     For (8, 7) exactly matches q_bf16_rne (native torch.bfloat16).
@@ -173,9 +289,11 @@ def fp_quantize_rne(x: Tensor, exp_bits: int, man_bits: int) -> Tensor:
         return x.to(torch.bfloat16).to(torch.float32)
     if exp_bits == 8:
         return _rne_e8(x, man_bits)
-    flat = x.detach().cpu().reshape(-1).tolist()
-    out_flat = [fp_quantize_rne_scalar(float(v), exp_bits, man_bits) for v in flat]
-    return torch.tensor(out_flat, dtype=torch.float32, device=x.device).view_as(x)
+    if _FORCE_SCALAR_PRIMITIVES or x.numel() < _VEC_MIN_ELEMS:
+        flat = x.detach().cpu().reshape(-1).tolist()
+        out_flat = [fp_quantize_rne_scalar(float(v), exp_bits, man_bits) for v in flat]
+        return torch.tensor(out_flat, dtype=torch.float32, device=x.device).view_as(x)
+    return _rne_vec(x, exp_bits, man_bits)
 
 def mx_product_saturate(x: Tensor, exp_bits: int, man_bits: int) -> Tensor:
     """Clamp product overflow to match MxPEOutToRaw saturation (MxFPMul.scala:374-377).
@@ -405,8 +523,113 @@ def fp_add_exact_scalar(x: float, y: float, exp_bits: int, man_bits: int) -> flo
         return 0.0
     return _round_dyadic_to_scalar(total < 0, abs(total), e_min, exp_bits, man_bits)
 
+def _add_exact_vec(x: Tensor, y: Tensor, exp_bits: int, man_bits: int) -> Tensor:
+    """Vectorized `fp_add_exact_scalar`: encode both operands into (exp_bits, man_bits), add the
+    significands EXACTLY, then round the sum back with RNE.
+
+    The scalar version encodes through `_encode_exact_scalar_to_fields`, which quantizes its input;
+    `_rne_vec` does the same thing, so the operands here are in-format and the alignment shift is
+    bounded by the format's exponent span (about 2*bias + man_bits, ~20 bits at exp_bits=4). That
+    bound is what keeps the exact sum inside int64 -- it is a precondition, not an approximation,
+    and it is why the inputs are quantized first rather than taken as given.
+    """
+    # `_encode_exact_scalar_to_fields` rounds to (exp_bits, man_bits) WITHOUT an overflow check --
+    # it keeps an out-of-range exponent field rather than saturating. Using fp_quantize_rne here
+    # would turn an over-range operand into inf and an inf-inf into NaN, which the scalar never
+    # does (measured: 150/4119 elements at (4,4), e.g. 512 + -294.727 -> 224, not NaN).
+    x_raw, y_raw = x.float(), y.float()
+    x = _rne_vec(x_raw, exp_bits, man_bits, overflow_to_inf=False)
+    y = _rne_vec(y_raw, exp_bits, man_bits, overflow_to_inf=False)
+
+    nan = torch.isnan(x) | torch.isnan(y)
+    ix, iy = torch.isinf(x), torch.isinf(y)
+    opposite_inf = ix & iy & (torch.signbit(x) != torch.signbit(y))
+    any_inf = ix | iy
+
+    zx, zy = (x_raw == 0), (y_raw == 0)
+
+    def _dyadic(v):
+        av = v.abs()
+        bad = torch.isnan(v) | torch.isinf(v) | (av == 0)
+        safe = torch.where(bad, torch.ones_like(av), av)
+        m_f, e_i = torch.frexp(safe)
+        num = (m_f.to(torch.float64) * float(1 << 24)).to(torch.int64)
+        num = torch.where(bad, torch.zeros_like(num), num)
+        return torch.signbit(v), num, e_i.to(torch.int64) - 24
+
+    sx, nx, ex = _dyadic(x)
+    sy, ny, ey = _dyadic(y)
+
+    e_min = torch.minimum(ex, ey)
+    lhs = nx << (ex - e_min).clamp(min=0, max=62)
+    rhs = ny << (ey - e_min).clamp(min=0, max=62)
+    total = torch.where(sx, -lhs, lhs) + torch.where(sy, -rhs, rhs)
+
+    neg = total < 0
+    mag = total.abs()
+
+    # Reuse the quantizer's rounding by rebuilding the value: mag * 2^e_min is exact in float64
+    # for the magnitudes reachable here (mag < 2^44 at exp_bits=4), so rounding it with _rne_vec is
+    # the same operation _round_dyadic_to_scalar performs on (mag, e_min).
+    val = torch.ldexp(mag.to(torch.float64), e_min.to(torch.int32)).to(torch.float32)
+    out = _rne_vec(val, exp_bits, man_bits)
+    out = torch.where(neg, -out, out)
+
+    out = torch.where(total == 0, torch.zeros_like(out), out)
+    # The scalar returns the OTHER OPERAND VERBATIM when one side is exactly zero -- unencoded,
+    # so the raw value, not its rounding. `kind == "zero"` tests the raw input, so a value that
+    # merely UNDERFLOWS to zero does not take this path.
+    out = torch.where(zx, y_raw, out)
+    out = torch.where(zy, x_raw, out)
+    out = torch.where(any_inf, torch.where(ix, x, y), out)
+    out = torch.where(opposite_inf | nan, torch.full_like(out, float("nan")), out)
+    return out
+
+
+def _add_exact_vec_is_exact(exp_bits: int, man_bits: int) -> bool:
+    """Can `_add_exact_vec` hold the EXACT sum for this format in int64?
+
+    The aligned significands span (24 bits from frexp) + (the format's exponent range,
+    2*bias + man_bits - 1), plus one bit for the carry and one for the sign. Past 62 the int64
+    shift silently truncates and the sum stops being exact -- so the scalar path is used instead
+    rather than returning a wrong answer. The RTL's accumulator lanes are exp_bits=4 (bias 7), which
+    needs ~44 bits and is comfortably inside; exp_bits=8 never reaches here (it has its own path).
+    """
+    bias = (1 << (exp_bits - 1)) - 1
+    return 24 + (2 * bias + man_bits - 1) + 2 <= 62
+
+
 def fp_add_exact(x: Tensor, y: Tensor, exp_bits: int, man_bits: int) -> Tensor:
     assert x.shape == y.shape
+    if exp_bits == 8 and man_bits == 7 and not _FORCE_SCALAR_PRIMITIVES:
+        # BF16 ADD, THE CROSS-TILE STEP. `bf16_accum_add` routes here, so it is on the hot path of
+        # every rtl_exact run -- and (8,7) is far too wide for the int64 path below, which would
+        # otherwise send it to the scalar loop at 0.74 Melem/s.
+        #
+        # fp32 add then round is EXACT here, not an approximation: double rounding from p1 = 24
+        # (float32) down to p2 = 8 (bf16) is innocuous whenever p1 >= 2*p2 + 2, and 24 >= 18. So
+        # the float32 sum cannot land where a second rounding disagrees with rounding the exact
+        # sum once. test_vector_primitives.py checks it against the scalar reference regardless.
+        # Quantize the operands FIRST. The scalar path encodes each into the format before
+        # adding (`_encode_exact_scalar_to_fields`), so adding raw values and rounding once is a
+        # DIFFERENT function whenever an operand is not already bf16 -- caught by
+        # tests/selftest_extracted.py at 685/4119 elements.
+        xr, yr = x.float(), y.float()
+        r = q_bf16_rne(q_bf16_rne(xr) + q_bf16_rne(yr))
+        # ... and pass the other operand through RAW on exact zero, as the scalar does.
+        return torch.where(xr == 0, yr, torch.where(yr == 0, xr, r))
+    if (not _FORCE_SCALAR_PRIMITIVES and x.numel() >= _VEC_MIN_ELEMS
+            and _add_exact_vec_is_exact(exp_bits, man_bits)):
+        # `_add_exact_vec_is_exact` bounds the alignment shift using the FORMAT's exponent span,
+        # which only holds while the operands are in-format. They need not be: the encode step
+        # deliberately does not saturate (see _add_exact_vec), so a wildly out-of-range input --
+        # 1e38 into (4,4) -- would need a ~136-bit shift and wrap int64. Check it and fall back.
+        # NaN fails the comparison and falls back too, which is correct if slower.
+        bias = (1 << (exp_bits - 1)) - 1
+        fmax = (2.0 - 2.0 ** -man_bits) * (2.0 ** bias)
+        in_range = bool((x.abs() <= fmax).all()) and bool((y.abs() <= fmax).all())
+        if in_range:
+            return _add_exact_vec(x, y, exp_bits, man_bits)
     x_flat = x.detach().cpu().reshape(-1).tolist()
     y_flat = y.detach().cpu().reshape(-1).tolist()
     out_flat = [fp_add_exact_scalar(float(a), float(b), exp_bits, man_bits)

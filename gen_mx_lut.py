@@ -30,7 +30,12 @@ ACC_PRECISION = [(4, 4)] * 8 + [(4, 5)] * 2 + [(4, 6)] * 5 + [(8, 7)] * 1
 
 def precision_for_dim(dim: int):
     prod = [(4, 3)] * dim
-    acc = ACC_PRECISION[:dim] if dim <= 16 else ACC_PRECISION + [(8, 7)] * (dim - 16)
+    if dim == 8:
+        acc = [(8, 7)] * 8   # DIM=8: ALL rows bf16 (design assumption -- no reduced-precision ramp)
+    elif dim <= 16:
+        acc = ACC_PRECISION[:dim]
+    else:
+        acc = ACC_PRECISION + [(8, 7)] * (dim - 16)
     return prod, acc
 
 
