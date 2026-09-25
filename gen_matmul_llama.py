@@ -178,6 +178,10 @@ SHAPES = [
     Shape("matmul_fp4_64x64_dim32.h", 64, 64, 64, "fp4", dim=32, layer="layer2",
           guard="INCLUDE_MATMUL_FP4_64X64_DIM32_H",
           tests=("matmul_tiled_fp4_64x64_requant_dim32",)),
+    # FP4 on the 8x8 (DIM=8) widen mesh -- quad nibble requant, DIM8 sibling of the dim32 fp4 test.
+    Shape("matmul_fp4_64x64_dim8.h", 64, 64, 64, "fp4", dim=8, layer="layer2",
+          guard="INCLUDE_MATMUL_FP4_64X64_DIM8_H",
+          tests=("matmul_tiled_fp4_64x64_requant_dim8",)),
     # FP4 DIM=32, larger: 2 i-tiles x 2 j-tiles (GN=4, loop_bound_j=2), deeper K -- stresses multi-tile.
     Shape("matmul_fp4_128x128_dim32.h", 128, 128, 128, "fp4", dim=32, layer="layer2",
           guard="INCLUDE_MATMUL_FP4_128X128_DIM32_H",
