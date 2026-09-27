@@ -99,7 +99,7 @@ def main():
                                                  "fp8:e5m2, fp8:e4m3, fp8:e4m3s).")
     ap.add_argument("--wei", required=True, help="Weight format spec (e.g. fp4:e2m1, fp6:e2m3, "
                                                  "fp8:e4m3, fp8:e4m3s).")
-    ap.add_argument("--dim", type=int, default=16, choices=(16, 32),
+    ap.add_argument("--dim", type=int, default=16, choices=(8, 16, 32),
                     help="Mesh DIM (per-tile accumulation depth). 16 reproduces committed headers.")
     ap.add_argument("--M", type=int, default=64)
     ap.add_argument("--K", type=int, default=64)
