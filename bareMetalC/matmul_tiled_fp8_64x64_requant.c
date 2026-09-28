@@ -9,6 +9,7 @@
 
 #include "include/gemmini_testutils.h"
 #include "include/matmul_fp8_64x64.h"
+#include "include/mx_perf.h"
 
 #define GEMMINI_SF_MEM 0x40088000
 #define GEMMINI_SF_MEM_A (GEMMINI_SF_MEM + 0x2000)
@@ -86,9 +87,11 @@ int main() {
   uint32_t acc_addr = (1u << (ADDR_LEN - 1));
 
   // ---- Gemmini setup ----
+  mx_perf_t perf = {0};
   gemmini_flush(0);
   gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 0, 0);
 
+  MX_PERF_MARK(perf.t0);
 #if defined(SPIKE_SIM) || defined(MX_ROCKET)
   // Unified real-RoCC path (Spike AND RTL): funct-27 MX_LOAD_SCALES. sel 0 = A/activation-row,
   // 1 = B/weight-col. The fence orders the async scale DMA on the RTL and is a no-op on Spike, so
@@ -100,6 +103,7 @@ int main() {
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, (uint8_t *) &A_scales_row, MATMUL_M, MATMUL_K);
   load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, (uint8_t *) &B_scales_col, MATMUL_N, MATMUL_K);
 #endif
+  MX_PERF_MARK(perf.t_sc);
 
   // ---- MVIN A: tile (i,k) -> a_base + (i*tiles_K + k)*DIM ----
   gemmini_config_ld(MATMUL_M * sizeof(elem_t));
@@ -112,6 +116,8 @@ int main() {
     }
   }
 
+  MX_PERF_MARK(perf.t_lda);
+
   // ---- MVIN B: tile (k,j) -> b_base + (j*tiles_K + k)*DIM ----
   for (int j = 0; j < tiles_J; j++) {
     for (int k = 0; k < tiles_K; k++) {
@@ -121,7 +127,11 @@ int main() {
     }
   }
 
+#if defined(SPIKE_SIM) || defined(MX_ROCKET)
+  int SPAD_DEST = a_base + tiles_I * tiles_K * DIM;   // just past A: no C/A overlap, store overlaps compute
+#else
   int SPAD_DEST = 128;
+#endif
 
   gemmini_config_st(1 * sizeof(out_t));
   gemmini_mxquant_config_mvout((uint64_t)scale_factors, tiles_I, tiles_J, tiles_K, 0, 0, 1);
@@ -133,6 +143,8 @@ int main() {
   uint32_t out_flag = 0x38;
 
   // ---- Compute ----
+  MX_PERF_MARK(perf.t_ld);
+  mx_perf_ctr_start(&perf);
   gemmini_loop_ws_spad(
       tiles_I, tiles_J, tiles_K,
       0, 0, 0,
@@ -146,6 +158,8 @@ int main() {
       0, 0,
       false,
       out_flag);
+  MX_PERF_MARK(perf.t_ex);
+  mx_perf_ctr_stop(&perf);
 
 //  for (int i = 0; i < tiles_I; i++) {
 //    for (int j = 0; j < tiles_J; j++) {
@@ -183,6 +197,7 @@ int main() {
     }
   }
 #endif
+  MX_PERF_MARK(perf.t_st);
 
 
 //  gemmini_mvout((void*)&C_hw[0][0], 128 )
@@ -249,6 +264,10 @@ int main() {
     printf("  differ by 3+ bits: %d\n", diff3plus);
   }
   errors += scale_errors;
+
+  mx_perf_report("fp8_64x64_requant", MATMUL_M, MATMUL_N, MATMUL_K, DIM, &perf);
+  mx_perf_report_load("fp8_64x64_requant", (int)(sizeof(A_scales_row) + sizeof(B_scales_col)),
+                      MATMUL_M * MATMUL_K, MATMUL_K * MATMUL_N, &perf);
 
 #ifndef BAREMETAL
   exit(errors != 0);

@@ -84,6 +84,9 @@ mx_tests = \
 	matmul_tiled_fp8_64x64_DRAMMvout \
 	matmul_tiled_fp8_64x64_smem_mvout \
 	matmul_tiled_fp8_128x128 \
+	matmul_tiled_fp8_128x128_chunked \
+	matmul_tiled_fp8_128x128_chunked4 \
+	mx_mem_bw \
 	matmul_tiled_fp8_128x128x256 \
 	matmul_tiled_fp8_128x128x256_DRAMMvout \
 	matmul_tiled_fp8_64x64_requant \
