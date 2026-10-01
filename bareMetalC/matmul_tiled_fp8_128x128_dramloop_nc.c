@@ -72,7 +72,12 @@ int main() {
 
   gemmini_extended3_config_ld(MATMUL_K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
   gemmini_extended3_config_ld(MATMUL_N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+#ifdef RELU_OUT
+  // ReLU on the accumulated output (store-path activation, applied before the BF16 store).
+  gemmini_extended_config_st(MATMUL_N * sizeof(uint16_t), RELU, ACC_SCALE_IDENTITY);
+#else
   gemmini_config_st(MATMUL_N * sizeof(uint16_t));
+#endif
 #ifdef LOOP_SCALES
   // no CONFIG_SCALE_MEM: each loop opens its execute stream with its own (bounds = loop dims, half = slot)
 #elif defined(SCALE_WAIT)
@@ -120,11 +125,18 @@ int main() {
   int errors = 0;
   for (int i = 0; i < MATMUL_M; i++)
     for (int j = 0; j < MATMUL_N; j++)
-      if (C_hw[i][j] != C_out_bf16[i][j]) {
+    {
+#ifdef RELU_OUT
+      const uint16_t exp = (C_out_bf16[i][j] & 0x8000) ? 0 : C_out_bf16[i][j];   // relu(golden)
+#else
+      const uint16_t exp = C_out_bf16[i][j];
+#endif
+      if (C_hw[i][j] != exp) {
         if (errors < 16)
-          printf("MISMATCH @(%d,%d) HW=0x%04x EXP=0x%04x\n", i, j, C_hw[i][j], C_out_bf16[i][j]);
+          printf("MISMATCH @(%d,%d) HW=0x%04x EXP=0x%04x\n", i, j, C_hw[i][j], exp);
         errors++;
       }
+    }
   if (errors == 0)
     printf("fp8 WS native multi-loop (%d chunks) test PASSED (no mismatches).\n", NCHUNKS);
   else

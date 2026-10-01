@@ -67,6 +67,37 @@
 #define k_MX_LUT_DISABLE 30
 #define k_LOOP_WS_CONFIG_SCALES 31
 #define k_LOOP_WS_CONFIG_SCALE_STRIDES 32
+#define k_VPU_EXEC 33
+#define k_SPAD_REQUANT 34
+
+// SPAD_REQUANT: row-major BF16 tile (M x N) at spad row `src` (row m starts at src + m*N/8) -> E4M3 codes at `dst`
+// (tiled = 0: flat row-major, N/16 spad rows per tile row; 1: operand-A tile layout dst + (i*N/16 + kt)*16 + r) and
+// one E8M0 per 32 values along a row, written row-major [M][N/32] to `scale_dram` (always written; < 2^33) and, if
+// `resident`, into the act-scale window as [N/32][M] for the next matmul. No CONFIG_SCALE_MEM needed.
+// N % 32 == 0, M % 8 == 0, M*N/32 a multiple of 32 and <= 2048. Ordered by the RS (4th queue).
+#define gemmini_spad_requant(dst, src, M, N, tiled, scale_dram, resident) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, \
+    ((uint64_t)(src) & 0x3FFF) | (((uint64_t)(dst) & 0x3FFF) << 14) | ((uint64_t)((tiled) ? 1 : 0) << 28) | \
+      ((uint64_t)((resident) ? 1 : 0) << 29) | (((uint64_t)(scale_dram) & 0x1FFFFFFFFULL) << 30), \
+    ((uint64_t)(M) & 0xFFFF) | (((uint64_t)(N) & 0xFFFF) << 16), k_SPAD_REQUANT)
+
+// VPU (MxE4M3VpuGemminiRocketConfig): BF16 ops on scratchpad rows (1 row = 8 BF16, lane l = bytes 2l..2l+1).
+// Ops/ref: include/vpu_ref.h. Addresses are scratchpad row addresses (as mvin); rows = src1 rows processed;
+// rlen = rows per logical row (reductions write one row per rlen rows at dst + g; bcast reads src2 once per rlen
+// rows); imm = BF16 scalar (ADDS/MULS). src/dst may alias only exactly (in place). Ordered against other Gemmini
+// commands by the reservation station (4th queue, row-range dependencies); gemmini_fence() waits for it.
+#define gemmini_vpu(op, dst, src1, src2, rows, rlen, bcast, imm) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, \
+    ((uint64_t)(src1) & 0x3FFF) | (((uint64_t)(src2) & 0x3FFF) << 14) | (((uint64_t)(dst) & 0x3FFF) << 28) | \
+      (((uint64_t)(rows) & 0xFFFF) << 42), \
+    ((uint64_t)(op) & 0xF) | ((uint64_t)((bcast) ? 1 : 0) << 4) | (((uint64_t)(rlen) & 0x3FF) << 5) | \
+      (((uint64_t)(imm) & 0xFFFF) << 16), \
+    k_VPU_EXEC)
+#define gemmini_vpu_binary(op, dst, src1, src2, rows) gemmini_vpu(op, dst, src1, src2, rows, 1, 0, 0)
+#define gemmini_vpu_scalar(op, dst, src1, imm, rows)  gemmini_vpu(op, dst, src1, 0, rows, 1, 0, imm)
+#define gemmini_vpu_unary(op, dst, src1, rows)        gemmini_vpu(op, dst, src1, 0, rows, 1, 0, 0)
+#define gemmini_vpu_reduce(op, dst, src1, rows, rlen) gemmini_vpu(op, dst, src1, 0, rows, rlen, 0, 0)
+#define gemmini_vpu_bcast(op, dst, src1, src2, rows, rlen) gemmini_vpu(op, dst, src1, src2, rows, rlen, 1, 0)
 
 // Load num_luts LUT codebooks from DRAM. Each entry is `entry_bits` wide (the DATATYPE being loaded:
 // FP6/E2M3 = 6, FP8 E5M2 = 8); 16 entries per codebook, LE-packed. The HW unpacks this native codebook

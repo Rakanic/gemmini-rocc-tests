@@ -44,15 +44,21 @@ from pathlib import Path
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
-NPU = HERE.parent.parent / "npu-exploration"
-if not (NPU / "app" / "mxq_golden.py").exists():
+#: NPU_EXPLORATION overrides the sibling checkout (e.g. to run against a worktree).
+NPU = Path(os.environ.get("NPU_EXPLORATION", HERE.parent.parent / "npu-exploration")).resolve()
+if not ((NPU / "compiler" / "operands.py").exists() or (NPU / "app" / "mxq_golden.py").exists()):
     raise SystemExit(f"npu-exploration not found at {NPU}")
 sys.path.insert(0, str(NPU))
 sys.path.insert(0, str(HERE))
 
 import torch  # noqa: E402
-from app.mxq_golden import golden, MXQ_ROOT  # noqa: E402
-from app.mxwire import e8m0_decode  # noqa: E402
+if (NPU / "compiler" / "operands.py").exists():   # npu-exploration's compiler/ layout (app/ dissolved)
+    from compiler.operands import encode as golden, e8m0_encode_exact, _require_no_pmax_shift  # noqa: E402
+    from compiler.wire import e8m0_decode  # noqa: E402
+else:                                              # the older app/ layout
+    from app.mxq_golden import golden, e8m0_encode_exact, _require_no_pmax_shift  # noqa: E402
+    from app.mxwire import e8m0_decode  # noqa: E402
+MXQ_ROOT = NPU / "MXQuant"
 
 BLOCK = 32
 
@@ -265,7 +271,6 @@ def quantize(V: np.ndarray, *, axis: str, f: Format, pmax_shift: int = 0):
         g = golden(V, axis=axis, fmt=f.mxq, pmax_shift=pmax_shift)
         return g.codes, g.scales, g.P
 
-    from app.mxq_golden import e8m0_encode_exact, _require_no_pmax_shift
     from end_to_end_linear.mx_block_quant import quantize_mx_block32
     model = __import__(f.model)
 
@@ -398,7 +403,6 @@ def build(shape: Shape, verbose: bool = True) -> dict[str, np.ndarray]:
     # Requantize that exact BF16 tile. axis="row" is the requantizer's own layout: one E8M0 byte
     # per row per 32 output columns, i.e. [M][N/32].
     if f.out_requant == "model":
-        from app.mxq_golden import e8m0_encode_exact
         C_q, C_sc = mm.matrix_mx_requantize(torch.from_numpy(C_bf16), f.name)
         C_codes = np.array(mm.tensor_to_custom_fp_codes(C_q, f.name)[0], dtype=np.uint8)
         C_scales = e8m0_encode_exact(C_sc.numpy().astype(np.float32))
@@ -619,7 +623,6 @@ def _requant(C_bf16: np.ndarray, f: Format):
     (out_requant="mxquant"); fp4/fp6 use the hardware quantizer via matrix_mx_requantize ("model").
     """
     if f.out_requant == "model":
-        from app.mxq_golden import e8m0_encode_exact
         mm = __import__(f.model)
         C_q, C_sc = mm.matrix_mx_requantize(torch.from_numpy(C_bf16), f.name)
         codes = np.array(mm.tensor_to_custom_fp_codes(C_q, f.name)[0], dtype=np.uint8)

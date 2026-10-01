@@ -95,6 +95,12 @@ mx_tests = \
 	matmul_tiled_fp8_128x128_dramloop_ls \
 	matmul_tiled_fp8_128x128_dramloop_ls4 \
 	matmul_tiled_fp8_128x128_dramloop_kt \
+	matmul_tiled_fp8_128x128_dramloop_relu \
+	vpu_ops \
+	vpu_softmax \
+	spad_requant \
+	chain_vpu_spad_requant \
+	chain_pipelined \
 	mx_mem_bw \
 	matmul_tiled_fp8_128x128x256 \
 	matmul_tiled_fp8_128x128x256_DRAMMvout \
