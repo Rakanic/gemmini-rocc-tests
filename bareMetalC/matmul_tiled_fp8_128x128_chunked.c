@@ -71,8 +71,17 @@ int main() {
   gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
 
   MX_PERF_MARK(perf.t0);
+#ifdef SCALES_2D
+  // 2-D loads straight from the [GK][M] / [GK][N] arrays: chunk c's A rows are a pitch-M slice; B repeats.
+  for (int c = 0; c < NCHUNKS; c++) {
+    gemmini_mx_load_scales_2d(&A_scales_row[0][c * CHUNK_M], CHUNK_M, MATMUL_GK, MATMUL_M,
+                              c * MATMUL_GK * CHUNK_M, 0);
+    gemmini_mx_load_scales_2d(B_scales_col, sizeof(B_scales_col), 1, 0, c * sizeof(B_scales_col), 1);
+  }
+#else
   gemmini_mx_load_scales((uint64_t)A_scales_chunked, sizeof(A_scales_chunked), 0);
   gemmini_mx_load_scales((uint64_t)B_scales_rep, sizeof(B_scales_rep), 1);
+#endif
   gemmini_fence();
 
   gemmini_config_ld(MATMUL_M * sizeof(elem_t));

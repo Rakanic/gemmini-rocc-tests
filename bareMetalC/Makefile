@@ -86,6 +86,15 @@ mx_tests = \
 	matmul_tiled_fp8_128x128 \
 	matmul_tiled_fp8_128x128_chunked \
 	matmul_tiled_fp8_128x128_chunked4 \
+	matmul_tiled_fp8_128x128_dramloop \
+	matmul_tiled_fp8_128x128_dramloop_nc \
+	matmul_tiled_fp8_128x128_dramloop_nc4 \
+	matmul_tiled_fp8_128x128_chunked_2d \
+	matmul_tiled_fp8_128x128_dramloop_nc_2d \
+	matmul_tiled_fp8_128x128_dramloop_nc_wait \
+	matmul_tiled_fp8_128x128_dramloop_ls \
+	matmul_tiled_fp8_128x128_dramloop_ls4 \
+	matmul_tiled_fp8_128x128_dramloop_kt \
 	mx_mem_bw \
 	matmul_tiled_fp8_128x128x256 \
 	matmul_tiled_fp8_128x128x256_DRAMMvout \

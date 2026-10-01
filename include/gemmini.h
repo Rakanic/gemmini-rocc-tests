@@ -65,6 +65,8 @@
 #define k_MX_READ_SMEM 28
 #define k_MX_LOAD_LUT  29
 #define k_MX_LUT_DISABLE 30
+#define k_LOOP_WS_CONFIG_SCALES 31
+#define k_LOOP_WS_CONFIG_SCALE_STRIDES 32
 
 // Load num_luts LUT codebooks from DRAM. Each entry is `entry_bits` wide (the DATATYPE being loaded:
 // FP6/E2M3 = 6, FP8 E5M2 = 8); 16 entries per codebook, LE-packed. The HW unpacks this native codebook
@@ -86,6 +88,13 @@
 #define gemmini_mx_load_scales(dram_addr, len, sel) \
   ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, (uint64_t)(dram_addr), \
     ((uint64_t)(sel) << 32) | ((uint64_t)(len) & 0xFFFFFFFFu), \
+    k_MX_LOAD_SCALES)
+
+// 2-D form: `rows` rows of `row_bytes`, DRAM rows `pitch` bytes apart (0 = contiguous), landing contiguously
+// from scale-mem byte offset `dest` (e.g. 4096 = the second half). All 8B-aligned.
+#define gemmini_mx_load_scales_2d(dram_addr, row_bytes, rows, pitch, dest, sel) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)(dram_addr) & 0xFFFFFFFFFFULL) | ((uint64_t)(pitch) << 40), \
+    ((uint64_t)(rows) << 46) | ((uint64_t)(dest) << 33) | ((uint64_t)(sel) << 32) | ((uint64_t)(row_bytes) & 0xFFFFFFFFu), \
     k_MX_LOAD_SCALES)
 
 #define gemmini_mx_read_smem(dram_addr, smem_off_bf16, num_bf16) \
@@ -243,6 +252,13 @@ static acc_scale_t_bits acc_scale_t_to_acc_scale_t_bits(acc_scale_t x) {
   ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, \
    ((uint64_t)(scale_w_sel) << 61) | ((uint64_t)(scale_act_sel) << 60) |  ((uint64_t)(k_bound) << 51) | ((uint64_t)(j_bound) << 42) | ((uint64_t)(i_bound) << 33) | (uint64_t)(dram_addr), \
     (uint64_t)(lut_update_granularity) & 0xFFFF, CONFIG_SCALE_MEM)
+
+// Same config, but rs2[16] = 1: the execute unit applies it only once every MX_LOAD_SCALES already issued into
+// the selected act/wgt halves has landed -- replaces the gemmini_fence() after the scale loads.
+#define gemmini_mxquant_config_mvout_wait(dram_addr, i_bound, j_bound, k_bound, scale_act_sel, scale_w_sel, lut_update_granularity) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, \
+   ((uint64_t)(scale_w_sel) << 61) | ((uint64_t)(scale_act_sel) << 60) |  ((uint64_t)(k_bound) << 51) | ((uint64_t)(j_bound) << 42) | ((uint64_t)(i_bound) << 33) | (uint64_t)(dram_addr), \
+    (1ULL << 16) | ((uint64_t)(lut_update_granularity) & 0xFFFF), CONFIG_SCALE_MEM)
 
 // C8.3 scale residency: identical to gemmini_mxquant_config_mvout but sets rs1 bit 62
 // (MX_SCALE_RESIDENT). Both Spike (mxquant_config_mvout handler) and RTL (ExecuteController
@@ -438,6 +454,17 @@ static int ceil_divide_int(int a, int b){
     ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, A_stride, B_stride, k_LOOP_WS_CONFIG_STRIDES_AB) \
     ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, D_stride, C_stride, k_LOOP_WS_CONFIG_STRIDES_DC) \
     ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)(a_spad_id) << 18) | ((uint64_t)(b_spad_id) << 16) | ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (ex_accumulate), ((is_resadd) << 2) | ((B_transpose) << 1) | (A_transpose), k_LOOP_WS) \
+  }
+
+// Native loop with loop-managed MX scales: the loop loads its own A/B scale slices ([K/32][I*DIM] rows of pitch
+// A_sc_pitch, [K/32][J*DIM] of pitch B_sc_pitch) into its scale half and orders them in HW -- no MX_LOAD_SCALES,
+// CONFIG_SCALE_MEM or fence around it. v1: BF16 output, no padding.
+#define gemmini_loop_ws_mx(I, J, K, A, B, C, A_stride, B_stride, C_stride, A_sc, B_sc, A_sc_pitch, B_sc_pitch, ex_accumulate, a_spad_id, b_spad_id) \
+  { \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, (uint64_t)(A_sc), (uint64_t)(B_sc), k_LOOP_WS_CONFIG_SCALES) \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, (uint64_t)(A_sc_pitch), (uint64_t)(B_sc_pitch), k_LOOP_WS_CONFIG_SCALE_STRIDES) \
+    gemmini_loop_ws(I, J, K, 0, 0, 0, A, B, NULL, C, A_stride, B_stride, 0, C_stride, \
+                    false, false, false, false, ex_accumulate, NO_ACTIVATION, a_spad_id, b_spad_id, false) \
   }
 
 #define gemmini_loop_ws_spad(I, J, K, pad_I, pad_J, pad_K, A, B, D, C, A_transpose, B_transpose, full_C, low_D, ex_accumulate, act, a_spad_id, b_spad_id, is_resadd, skips) \
