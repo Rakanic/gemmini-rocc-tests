@@ -14,7 +14,9 @@
 #define VPU_LANES 8
 
 enum { VPU_ADD = 0, VPU_SUB = 1, VPU_MUL = 2, VPU_ADDS = 3, VPU_MULS = 4,
-       VPU_EXP = 5, VPU_RCP = 6, VPU_RSQRT = 7, VPU_RMAX = 8, VPU_RSUM = 9, VPU_RAMAX = 10 };
+       VPU_EXP = 5, VPU_RCP = 6, VPU_RSQRT = 7, VPU_RMAX = 8, VPU_RSUM = 9, VPU_RAMAX = 10, VPU_MAX = 11, VPU_EXPSUB = 12 };
+static inline int vpu_is_reduction(int op) { return op == VPU_RMAX || op == VPU_RSUM || op == VPU_RAMAX; }
+static inline int vpu_uses_src2(int op) { return op <= VPU_MUL || op == VPU_MAX || op == VPU_EXPSUB; }
 
 // LUTs = the RTL's Scala tables (round-half-up of the double value)
 static const uint32_t vpu_rcp_tab[128] = {65536, 65028, 64528, 64035, 63550, 63072, 62602, 62138, 61681, 61231, 60787, 60350, 59919, 59494, 59075, 58662, 58254, 57852, 57456, 57065, 56680, 56299, 55924, 55554, 55188, 54828, 54471, 54120, 53773, 53431, 53092, 52759, 52429, 52103, 51782, 51464, 51150, 50840, 50534, 50231, 49932, 49637, 49345, 49056, 48771, 48489, 48210, 47935, 47663, 47393, 47127, 46864, 46603, 46346, 46091, 45839, 45590, 45344, 45100, 44859, 44620, 44384, 44151, 43919, 43691, 43464, 43240, 43019, 42799, 42582, 42367, 42154, 41943, 41734, 41528, 41323, 41121, 40920, 40721, 40525, 40330, 40137, 39946, 39756, 39569, 39383, 39199, 39017, 38836, 38657, 38480, 38304, 38130, 37958, 37787, 37617, 37449, 37283, 37118, 36954, 36792, 36631, 36472, 36314, 36158, 36003, 35849, 35696, 35545, 35395, 35246, 35099, 34953, 34808, 34664, 34521, 34380, 34239, 34100, 33962, 33825, 33689, 33554, 33421, 33288, 33157, 33026, 32897};
@@ -119,7 +121,7 @@ static inline uint16_t vpu_exp(uint16_t x) {
 // replicated in every lane. rows are scratchpad rows of VPU_LANES BF16. src/dst may only alias exactly (in place).
 static inline void vpu_ref_exec(int op, uint16_t (*dst)[VPU_LANES], const uint16_t (*src1)[VPU_LANES],
                                 const uint16_t (*src2)[VPU_LANES], int rows, int rlen, int bcast, uint16_t imm) {
-  if (op >= VPU_RMAX) {
+  if (vpu_is_reduction(op)) {
     for (int g = 0; g < rows / rlen; g++) {
       uint16_t mx = 0; float acc = 0;
       for (int j = 0; j < rlen; j++) {
@@ -142,16 +144,18 @@ static inline void vpu_ref_exec(int op, uint16_t (*dst)[VPU_LANES], const uint16
   }
   for (int i = 0; i < rows; i++) {
     const uint16_t *a = src1[i];
-    const uint16_t *b = (op <= VPU_MUL) ? src2[bcast ? i / rlen : i] : 0;
+    const uint16_t *b = vpu_uses_src2(op) ? src2[bcast ? i / rlen : i] : 0;
     uint16_t out[VPU_LANES];
     for (int l = 0; l < VPU_LANES; l++) {
       switch (op) {
         case VPU_ADD:   out[l] = vpu_add(a[l], b[l]); break;
         case VPU_SUB:   out[l] = vpu_sub(a[l], b[l]); break;
         case VPU_MUL:   out[l] = vpu_mul(a[l], b[l]); break;
+        case VPU_MAX:   out[l] = vpu_max(a[l], b[l]); break;
         case VPU_ADDS:  out[l] = vpu_add(a[l], imm); break;
         case VPU_MULS:  out[l] = vpu_mul(a[l], imm); break;
         case VPU_EXP:   out[l] = vpu_exp(a[l]); break;
+        case VPU_EXPSUB: out[l] = vpu_exp(vpu_sub(a[l], b[l])); break;
         case VPU_RCP:   out[l] = vpu_rcp(a[l]); break;
         case VPU_RSQRT: out[l] = vpu_rsqrt(a[l]); break;
         default:        out[l] = a[l]; break;

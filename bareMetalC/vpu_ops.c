@@ -65,7 +65,7 @@ static int run(const char *name, int op, uint32_t dst, uint32_t s1, uint32_t s2,
                const uint16_t (*h2)[VPU_LANES], int rows, int rlen, int bcast, uint16_t imm) {
   gemmini_vpu(op, dst, s1, s2, rows, rlen, bcast, imm);
   VFENCE();
-  int nout = op >= VPU_RMAX ? rows / rlen : rows;
+  int nout = vpu_is_reduction(op) ? rows / rlen : rows;
   memset(out_hw, 0xa5, sizeof(out_hw));
   mvout_rows(out_hw, dst, nout);
   gemmini_fence();
@@ -106,7 +106,13 @@ int main() {
   fail |= run("mul",          VPU_MUL,  SP_D, SP_A, SP_B,  A, B,  N, 1, 0, 0);
   fail |= run("mul same-bank",VPU_MUL,  SP_D, SP_A, SP_A2, A, A2, N, 1, 0, 0);
   fail |= run("mul bcast",    VPU_MUL,  SP_D, SP_A, SP_B,  A, B,  N, RL, 1, 0);
+  fail |= run("max",          VPU_MAX,  SP_D, SP_A, SP_B,  A, B,  N, 1, 0, 0);
+  fail |= run("max same-bank",VPU_MAX,  SP_D, SP_A, SP_A2, A, A2, N, 1, 0, 0);
+  fail |= run("max bcast",    VPU_MAX,  SP_D, SP_A, SP_B,  A, B,  N, RL, 1, 0);
   fail |= run("sub bcast sb", VPU_SUB,  SP_D, SP_A, SP_A2, A, A2, N, RL, 1, 0);
+  fail |= run("expsub",       VPU_EXPSUB, SP_D, SP_A, SP_B,  A, B,  N, 1, 0, 0);
+  fail |= run("expsub bcast", VPU_EXPSUB, SP_D, SP_A, SP_B,  A, B,  N, RL, 1, 0);
+  fail |= run("expsub sb",    VPU_EXPSUB, SP_D, SP_A, SP_A2, A, A2, N, RL, 1, 0);
   fail |= run("adds",         VPU_ADDS, SP_D, SP_A, 0,     A, 0,  N, 1, 0, bf_3);
   fail |= run("muls",         VPU_MULS, SP_D, SP_A, 0,     A, 0,  N, 1, 0, bf_half);
   fail |= run("exp",          VPU_EXP,  SP_D, SP_R + 0x400, 0, X, 0, N, 1, 0, 0);

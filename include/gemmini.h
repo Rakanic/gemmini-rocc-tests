@@ -128,6 +128,22 @@
     ((uint64_t)(rows) << 46) | ((uint64_t)(dest) << 33) | ((uint64_t)(sel) << 32) | ((uint64_t)(row_bytes) & 0xFFFFFFFFu), \
     k_MX_LOAD_SCALES)
 
+// Managed scale halves from software (what the loop unit does for native loops). A GATED load (rs2[54]) starts only
+// once its half (dest bit 12) is FREE and marks it LOADED; a MANAGED config (CONFIG_SCALE_MEM rs2[17]) applies only
+// with the execute unit drained and its weight half LOADED + landed, marks that half INUSE and frees the other one.
+// act_in_place (rs2[18]) skips the act-half check (scales already resident). Alternate halves per matmul.
+#define gemmini_mx_load_scales_2d_gated(dram_addr, row_bytes, rows, pitch, dest, sel) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)(dram_addr) & 0xFFFFFFFFFFULL) | ((uint64_t)(pitch) << 40), \
+    (1ULL << 54) | ((uint64_t)(rows) << 46) | ((uint64_t)(dest) << 33) | ((uint64_t)(sel) << 32) | \
+    ((uint64_t)(row_bytes) & 0xFFFFFFFFu), k_MX_LOAD_SCALES)
+#define gemmini_mxquant_config_mvout_managed(dram_addr, i_bound, j_bound, k_bound, scale_act_sel, scale_w_sel, \
+                                             lut_update_granularity, act_in_place) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, \
+   ((uint64_t)(scale_w_sel) << 61) | ((uint64_t)(scale_act_sel) << 60) | ((uint64_t)(k_bound) << 51) | \
+   ((uint64_t)(j_bound) << 42) | ((uint64_t)(i_bound) << 33) | (uint64_t)(dram_addr), \
+    ((uint64_t)((act_in_place) ? 1 : 0) << 18) | (1ULL << 17) | ((uint64_t)(lut_update_granularity) & 0xFFFF), \
+    CONFIG_SCALE_MEM)
+
 #define gemmini_mx_read_smem(dram_addr, smem_off_bf16, num_bf16) \
   ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, (uint64_t)(dram_addr), \
     ((uint64_t)(num_bf16) << 32) | ((uint64_t)(smem_off_bf16) & 0xFFFFFFFFu), \
