@@ -142,6 +142,28 @@ int main() {
   vpu_ref_exec(VPU_ADD, out_ref, A, B, N, 1, 0, 0);
   fail |= check("war mvin", N);
 
+  // two VPUs: independent ops in disjoint banks run side by side (X: bank 0, Y: bank 3); Z reads X's result on the
+  // other VPU (RAW across VPUs). No fences: ordering is the RS's.
+  static uint16_t ref_x[N][VPU_LANES], ref_y[N][VPU_LANES], out_x[N][VPU_LANES] __attribute__((aligned(64)));
+  static uint16_t out_y[N][VPU_LANES] __attribute__((aligned(64)));
+  gemmini_vpu(VPU_ADDS, SP_A + 0x400, SP_A, 0, N, 1, 0, bf_3);        // X  (bank 0)
+  gemmini_vpu(VPU_EXP,  SP_R, SP_R + 0x400, 0, N, 1, 0, 0);           // Y  (bank 3)
+  gemmini_vpu(VPU_MUL,  SP_D, SP_A + 0x400, SP_B, N, 1, 0, 0);        // Z = X * B (banks 0, 1 -> 2)
+  mvout_rows(out_x, SP_A + 0x400, N);
+  mvout_rows(out_y, SP_R, N);
+  mvout_rows(out_hw, SP_D, N);
+  gemmini_fence();
+  vpu_ref_exec(VPU_ADDS, ref_x, A2, 0, N, 1, 0, bf_3);   // SP_A holds A2 since the WAR case above
+  vpu_ref_exec(VPU_EXP,  ref_y, X, 0, N, 1, 0, 0);
+  vpu_ref_exec(VPU_MUL,  out_ref, ref_x, B, N, 1, 0, 0);
+  int dual = 0;
+  for (int r = 0; r < N; r++)
+    for (int l = 0; l < VPU_LANES; l++)
+      dual += (out_x[r][l] != ref_x[r][l]) + (out_y[r][l] != ref_y[r][l]);
+  printf("%-14s %s (%d mismatches)\n", "dual X,Y", dual ? "FAIL" : "ok", dual);
+  fail |= dual != 0;
+  fail |= check("dual Z=X*B", N);
+
   printf("vpu_ops %s\n", fail ? "FAILED" : "PASSED");
   return fail;
 }
