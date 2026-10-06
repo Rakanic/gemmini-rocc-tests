@@ -16,6 +16,10 @@ int main() { printf("skipped: VPU config / Spike-only test\n"); return 0; }
 #define VPU_FENCE 0
 #endif
 #define VFENCE() do { if (VPU_FENCE) gemmini_fence(); } while (0)
+// 1: also test the optional fused ops (EXPSUB, EXPSUM); needs a VPU built with VpuParams(expSub, expSum)
+#ifndef VPU_FUSED
+#define VPU_FUSED 0
+#endif
 
 #define N 64          // scratchpad rows per operand (512 BF16)
 #define RL 4          // rows per logical row for reductions / broadcast
@@ -110,9 +114,25 @@ int main() {
   fail |= run("max same-bank",VPU_MAX,  SP_D, SP_A, SP_A2, A, A2, N, 1, 0, 0);
   fail |= run("max bcast",    VPU_MAX,  SP_D, SP_A, SP_B,  A, B,  N, RL, 1, 0);
   fail |= run("sub bcast sb", VPU_SUB,  SP_D, SP_A, SP_A2, A, A2, N, RL, 1, 0);
+#if VPU_FUSED
   fail |= run("expsub",       VPU_EXPSUB, SP_D, SP_A, SP_B,  A, B,  N, 1, 0, 0);
   fail |= run("expsub bcast", VPU_EXPSUB, SP_D, SP_A, SP_B,  A, B,  N, RL, 1, 0);
   fail |= run("expsub sb",    VPU_EXPSUB, SP_D, SP_A, SP_A2, A, A2, N, RL, 1, 0);
+  {   // EXPSUM: the exp rows (as EXPSUB) and, at SP_R, one row sum per logical row (as RSUM over them)
+    static uint16_t sums_ref[N][VPU_LANES];
+    const uint32_t pairs[2] = {SP_B, SP_A2};
+    const uint16_t (*h2s[2])[VPU_LANES] = {B, A2};
+    for (int t = 0; t < 2; t++) {
+      fail |= run(t ? "expsum sb" : "expsum bcast", VPU_EXPSUM, SP_D, SP_A, pairs[t], A, h2s[t], N, RL, 1, SP_R);
+      vpu_ref_exec(VPU_RSUM, sums_ref, (const uint16_t (*)[VPU_LANES])out_ref, 0, N, RL, 0, 0);
+      memset(out_hw, 0xa5, sizeof(out_hw));
+      mvout_rows(out_hw, SP_R, N / RL);
+      gemmini_fence();
+      memcpy(out_ref, sums_ref, sizeof(sums_ref));
+      fail |= check(t ? "expsum sb sums" : "expsum sums", N / RL);
+    }
+  }
+#endif
   fail |= run("adds",         VPU_ADDS, SP_D, SP_A, 0,     A, 0,  N, 1, 0, bf_3);
   fail |= run("muls",         VPU_MULS, SP_D, SP_A, 0,     A, 0,  N, 1, 0, bf_half);
   fail |= run("exp",          VPU_EXP,  SP_D, SP_R + 0x400, 0, X, 0, N, 1, 0, 0);

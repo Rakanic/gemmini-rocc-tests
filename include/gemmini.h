@@ -98,6 +98,8 @@
 #define gemmini_vpu_unary(op, dst, src1, rows)        gemmini_vpu(op, dst, src1, 0, rows, 1, 0, 0)
 #define gemmini_vpu_reduce(op, dst, src1, rows, rlen) gemmini_vpu(op, dst, src1, 0, rows, rlen, 0, 0)
 #define gemmini_vpu_bcast(op, dst, src1, src2, rows, rlen) gemmini_vpu(op, dst, src1, src2, rows, rlen, 1, 0)
+// EXPSUM (op 13, optional VpuParams.expSum): dst = exp(src1 - src2[row-broadcast]); sums[g] = row sum of logical row g
+#define gemmini_vpu_expsum(dst, src1, src2, sums, rows, rlen) gemmini_vpu(13, dst, src1, src2, rows, rlen, 1, sums)
 
 // Load num_luts LUT codebooks from DRAM. Each entry is `entry_bits` wide (the DATATYPE being loaded:
 // FP6/E2M3 = 6, FP8 E5M2 = 8); 16 entries per codebook, LE-packed. The HW unpacks this native codebook
