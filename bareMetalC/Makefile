@@ -99,6 +99,7 @@ mx_tests = \
 	vpu_ops \
 	vpu_softmax \
 	spad_requant \
+	spad_requant_fp4 \
 	chain_vpu_spad_requant \
 	chain_pipelined \
 	mx_mem_bw \

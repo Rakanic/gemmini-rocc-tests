@@ -80,6 +80,12 @@
     ((uint64_t)(src) & 0x3FFF) | (((uint64_t)(dst) & 0x3FFF) << 14) | ((uint64_t)((tiled) ? 1 : 0) << 28) | \
       ((uint64_t)((resident) ? 1 : 0) << 29) | (((uint64_t)(scale_dram) & 0x1FFFFFFFFULL) << 30), \
     ((uint64_t)(M) & 0xFFFF) | (((uint64_t)(N) & 0xFFFF) << 16), k_SPAD_REQUANT)
+// FP4 (E2M1) output: 2 rows per byte (row 2r low nibble) -- flat [M/2][N] bytes or tiled as the FP4 operand A
+#define gemmini_spad_requant_fp4(dst, src, M, N, tiled, scale_dram, resident) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, \
+    ((uint64_t)(src) & 0x3FFF) | (((uint64_t)(dst) & 0x3FFF) << 14) | ((uint64_t)((tiled) ? 1 : 0) << 28) | \
+      ((uint64_t)((resident) ? 1 : 0) << 29) | (((uint64_t)(scale_dram) & 0x1FFFFFFFFULL) << 30), \
+    ((uint64_t)(M) & 0xFFFF) | (((uint64_t)(N) & 0xFFFF) << 16) | (1ULL << 32), k_SPAD_REQUANT)
 
 // VPU (MxE4M3VpuGemminiRocketConfig): BF16 ops on scratchpad rows (1 row = 8 BF16, lane l = bytes 2l..2l+1).
 // Ops/ref: include/vpu_ref.h. Addresses are scratchpad row addresses (as mvin); rows = src1 rows processed;
