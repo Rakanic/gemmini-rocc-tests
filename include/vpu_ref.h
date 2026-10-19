@@ -1,6 +1,6 @@
 // Bit-exact reference of the Gemmini VPU (src/main/scala/gemmini/vpu/{Vpu,VpuMath}.scala).
 // Shared by the bare-metal tests (golden on the host) and the Spike model (libgemmini).
-// One VPU row = one scratchpad row = 8 BF16 lanes; lane l is bytes [2l, 2l+1] (little-endian) of the row.
+// One VPU row = one scratchpad row = VPU_LANES (8, or 4 at DIM=8) BF16 lanes; lane l is bytes [2l, 2l+1] (little-endian) of the row.
 #ifndef VPU_REF_H
 #define VPU_REF_H
 
@@ -11,7 +11,9 @@
 #pragma GCC push_options
 #pragma GCC optimize("no-fast-math")
 
+#ifndef VPU_LANES   // one DIM-byte spad row of BF16: 8 at DIM 16, 4 on the 8x8 mesh
 #define VPU_LANES 8
+#endif
 
 enum { VPU_ADD = 0, VPU_SUB = 1, VPU_MUL = 2, VPU_ADDS = 3, VPU_MULS = 4,
        VPU_EXP = 5, VPU_RCP = 6, VPU_RSQRT = 7, VPU_RMAX = 8, VPU_RSUM = 9, VPU_RAMAX = 10, VPU_MAX = 11,
@@ -135,7 +137,12 @@ static inline void vpu_ref_exec(int op, uint16_t (*dst)[VPU_LANES], const uint16
           rm = l == 0 ? v : vpu_max(rm, v);
           s[l] = vpu_bf16_to_f(a[l]);
         }
-        float rs = ((s[0] + s[1]) + (s[2] + s[3])) + ((s[4] + s[5]) + (s[6] + s[7]));
+        // the RTL's pairwise lane tree (Vpu.scala tree: grouped(2) recursively); 8 lanes: ((0+1)+(2+3))+((4+5)+(6+7))
+        float t[VPU_LANES];
+        for (int l = 0; l < VPU_LANES; l++) t[l] = s[l];
+        for (int w = VPU_LANES; w > 1; w >>= 1)
+          for (int l = 0; l < w / 2; l++) t[l] = t[2 * l] + t[2 * l + 1];
+        float rs = t[0];
         mx = j == 0 ? rm : vpu_max(mx, rm);
         acc = j == 0 ? rs : acc + rs;
       }

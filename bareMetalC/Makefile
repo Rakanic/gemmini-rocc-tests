@@ -72,6 +72,10 @@ mx_tests = \
 	matmul_tiled_fp6_128x128x512_requant \
 	matmul_tiled_fp6_64x64_chain \
 	matmul_tiled_fp6_128x128_chain \
+	matmul_tiled_fp6_128x128_chunk_timing \
+	matmul_tiled_fp6_128x128_chunk4_timing \
+	matmul_tiled_fp6_128x128_lut_blocked \
+	matmul_tiled_fp6_128x128_lut_dramloop \
 	matmul_tiled_fp4_128x128 \
 	matmul_tiled_fp4_128x128x512 \
 	matmul_tiled_fp8_64x64 \
@@ -100,6 +104,7 @@ mx_tests = \
 	vpu_softmax \
 	spad_requant \
 	spad_requant_fp4 \
+	spad_requant_lut_fp6 \
 	chain_vpu_spad_requant \
 	chain_pipelined \
 	mx_mem_bw \

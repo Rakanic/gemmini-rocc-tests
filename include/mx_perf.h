@@ -58,9 +58,11 @@ static void mx_perf_ctr_stop(mx_perf_t *p) {
 #endif
 }
 
-static void mx_perf_report(const char *name, int M, int N, int K, int dim, const mx_perf_t *p) {
+// Quad-throughput ideal (FP4 / LUT 4-bit operands: 4 MACs per PE per cycle).
+#define MX_PERF_IDEAL_QUAD(M, N, K, dim) ((uint64_t)(M) * (N) * (K) / (4 * (uint64_t)(dim) * (dim)))
+
+static void mx_perf_report_ideal(const char *name, int M, int N, int K, int dim, uint64_t ideal, const mx_perf_t *p) {
   uint64_t ld = p->t_ld - p->t0, ex = p->t_ex - p->t_ld, st = p->t_st - p->t_ex;
-  uint64_t ideal = (uint64_t)M * N * K / ((uint64_t)dim * dim);
   uint64_t util = ex ? ideal * 1000 / ex : 0;
   printf("PERF %s M=%d N=%d K=%d DIM=%d load=%lu compute=%lu mvout=%lu total=%lu ideal=%lu util=%lu.%lu%%\n",
          name, M, N, K, dim, (unsigned long)ld, (unsigned long)ex, (unsigned long)st,
@@ -73,6 +75,10 @@ static void mx_perf_report(const char *name, int M, int N, int K, int dim, const
   uint64_t busy = (uint64_t)p->ctr[2] + p->ctr[3] + p->ctr[6];
   printf(" other=%ld\n", (long)(ex - busy));
 #endif
+}
+
+static void mx_perf_report(const char *name, int M, int N, int K, int dim, const mx_perf_t *p) {
+  mx_perf_report_ideal(name, M, N, K, dim, (uint64_t)M * N * K / ((uint64_t)dim * dim), p);
 }
 
 // Load-phase counters: start after the scale load (MARK t_sc), snapshot at t_lda and t_ld.

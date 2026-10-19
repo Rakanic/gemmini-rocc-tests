@@ -24,11 +24,13 @@ int main() { printf("skipped: VPU config / Spike-only test\n"); return 0; }
 #define N 64          // scratchpad rows per operand (512 BF16)
 #define RL 4          // rows per logical row for reductions / broadcast
 // operands spread over banks: A bank 0, B bank 1, A2 bank 0 (same-bank pair), outputs bank 2/3
+// in BANK_ROWS units so every DIM stays in its own bank (DIM=16: 0x0, 0x800, 0x1000, 0x2000, 0x3000, off 0x400)
 #define SP_A   0x0000
-#define SP_A2  0x0800
-#define SP_B   0x1000
-#define SP_D   0x2000
-#define SP_R   0x3000
+#define SP_A2  (BANK_ROWS / 2)
+#define SP_B   (1 * BANK_ROWS)
+#define SP_D   (2 * BANK_ROWS)
+#define SP_R   (3 * BANK_ROWS)
+#define SP_OFF (BANK_ROWS / 4)
 
 static uint16_t A[N][VPU_LANES] __attribute__((aligned(64)));
 static uint16_t A2[N][VPU_LANES] __attribute__((aligned(64)));
@@ -99,8 +101,8 @@ int main() {
   mvin_rows(A, SP_A, N);
   mvin_rows(A2, SP_A2, N);
   mvin_rows(B, SP_B, N);
-  mvin_rows(P, SP_D + 0x400, N);
-  mvin_rows(X, SP_R + 0x400, N);
+  mvin_rows(P, SP_D + SP_OFF, N);
+  mvin_rows(X, SP_R + SP_OFF, N);
   VFENCE();
 
   int fail = 0;
@@ -135,9 +137,9 @@ int main() {
 #endif
   fail |= run("adds",         VPU_ADDS, SP_D, SP_A, 0,     A, 0,  N, 1, 0, bf_3);
   fail |= run("muls",         VPU_MULS, SP_D, SP_A, 0,     A, 0,  N, 1, 0, bf_half);
-  fail |= run("exp",          VPU_EXP,  SP_D, SP_R + 0x400, 0, X, 0, N, 1, 0, 0);
+  fail |= run("exp",          VPU_EXP,  SP_D, SP_R + SP_OFF, 0, X, 0, N, 1, 0, 0);
   fail |= run("rcp",          VPU_RCP,  SP_D, SP_A, 0,     A, 0,  N, 1, 0, 0);
-  fail |= run("rsqrt",        VPU_RSQRT,SP_R, SP_D + 0x400, 0, P, 0, N, 1, 0, 0);
+  fail |= run("rsqrt",        VPU_RSQRT,SP_R, SP_D + SP_OFF, 0, P, 0, N, 1, 0, 0);
   fail |= run("rmax",         VPU_RMAX, SP_R, SP_A, 0,     A, 0,  N, RL, 0, 0);
   fail |= run("ramax",        VPU_RAMAX,SP_R, SP_A, 0,     A, 0,  N, RL, 0, 0);
   fail |= run("rsum",         VPU_RSUM, SP_R, SP_A, 0,     A, 0,  N, RL, 0, 0);
@@ -166,10 +168,10 @@ int main() {
   // other VPU (RAW across VPUs). No fences: ordering is the RS's.
   static uint16_t ref_x[N][VPU_LANES], ref_y[N][VPU_LANES], out_x[N][VPU_LANES] __attribute__((aligned(64)));
   static uint16_t out_y[N][VPU_LANES] __attribute__((aligned(64)));
-  gemmini_vpu(VPU_ADDS, SP_A + 0x400, SP_A, 0, N, 1, 0, bf_3);        // X  (bank 0)
-  gemmini_vpu(VPU_EXP,  SP_R, SP_R + 0x400, 0, N, 1, 0, 0);           // Y  (bank 3)
-  gemmini_vpu(VPU_MUL,  SP_D, SP_A + 0x400, SP_B, N, 1, 0, 0);        // Z = X * B (banks 0, 1 -> 2)
-  mvout_rows(out_x, SP_A + 0x400, N);
+  gemmini_vpu(VPU_ADDS, SP_A + SP_OFF, SP_A, 0, N, 1, 0, bf_3);        // X  (bank 0)
+  gemmini_vpu(VPU_EXP,  SP_R, SP_R + SP_OFF, 0, N, 1, 0, 0);           // Y  (bank 3)
+  gemmini_vpu(VPU_MUL,  SP_D, SP_A + SP_OFF, SP_B, N, 1, 0, 0);        // Z = X * B (banks 0, 1 -> 2)
+  mvout_rows(out_x, SP_A + SP_OFF, N);
   mvout_rows(out_y, SP_R, N);
   mvout_rows(out_hw, SP_D, N);
   gemmini_fence();

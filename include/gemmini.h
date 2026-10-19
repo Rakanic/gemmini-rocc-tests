@@ -67,6 +67,7 @@
 #define k_MX_LUT_DISABLE 30
 #define k_LOOP_WS_CONFIG_SCALES 31
 #define k_LOOP_WS_CONFIG_SCALE_STRIDES 32
+#define k_LOOP_WS_CONFIG_LUTS 35   // rs1 / rs2 = act-in / weight codebooks DRAM addr (loop-managed, LUT half = loop slot)
 #define k_VPU_EXEC 33
 #define k_SPAD_REQUANT 34
 
@@ -75,27 +76,44 @@
 // one E8M0 per 32 values along a row, written row-major [M][N/32] to `scale_dram` (always written; < 2^33) and, if
 // `resident`, into the act-scale window as [N/32][M] for the next matmul. No CONFIG_SCALE_MEM needed.
 // N % 32 == 0, M % 8 == 0, M*N/32 a multiple of 32 and <= 2048. Ordered by the RS (4th queue).
+// Row-address field width F of SPAD_REQUANT / VPU_EXEC (the params header's SPAD_ROW_ADDR_BITS: 14, 15 at DIM=8).
+#ifndef SPAD_ROW_ADDR_BITS
+#define SPAD_ROW_ADDR_BITS 14
+#endif
+#define GEMMINI_RA_MASK ((1ULL << SPAD_ROW_ADDR_BITS) - 1)
+// rs1 = src[F-1:0] | dst[2F-1:F] | tiled[2F] | resident[2F+1] | scale DRAM addr from bit 2F+2 (33 bits at F 14, 32 at 15)
+#define GEMMINI_SR_RS1(dst, src, tiled, scale_dram, resident) \
+  (((uint64_t)(src) & GEMMINI_RA_MASK) | (((uint64_t)(dst) & GEMMINI_RA_MASK) << SPAD_ROW_ADDR_BITS) | \
+   ((uint64_t)((tiled) ? 1 : 0) << (2 * SPAD_ROW_ADDR_BITS)) | ((uint64_t)((resident) ? 1 : 0) << (2 * SPAD_ROW_ADDR_BITS + 1)) | \
+   (((uint64_t)(scale_dram) & (SPAD_ROW_ADDR_BITS == 14 ? 0x1FFFFFFFFULL : 0xFFFFFFFFULL)) << (2 * SPAD_ROW_ADDR_BITS + 2)))
 #define gemmini_spad_requant(dst, src, M, N, tiled, scale_dram, resident) \
   ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, \
-    ((uint64_t)(src) & 0x3FFF) | (((uint64_t)(dst) & 0x3FFF) << 14) | ((uint64_t)((tiled) ? 1 : 0) << 28) | \
-      ((uint64_t)((resident) ? 1 : 0) << 29) | (((uint64_t)(scale_dram) & 0x1FFFFFFFFULL) << 30), \
+    GEMMINI_SR_RS1(dst, src, tiled, scale_dram, resident), \
     ((uint64_t)(M) & 0xFFFF) | (((uint64_t)(N) & 0xFFFF) << 16), k_SPAD_REQUANT)
 // FP4 (E2M1) output: 2 rows per byte (row 2r low nibble) -- flat [M/2][N] bytes or tiled as the FP4 operand A
 #define gemmini_spad_requant_fp4(dst, src, M, N, tiled, scale_dram, resident) \
   ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, \
-    ((uint64_t)(src) & 0x3FFF) | (((uint64_t)(dst) & 0x3FFF) << 14) | ((uint64_t)((tiled) ? 1 : 0) << 28) | \
-      ((uint64_t)((resident) ? 1 : 0) << 29) | (((uint64_t)(scale_dram) & 0x1FFFFFFFFULL) << 30), \
+    GEMMINI_SR_RS1(dst, src, tiled, scale_dram, resident), \
     ((uint64_t)(M) & 0xFFFF) | (((uint64_t)(N) & 0xFFFF) << 16) | (1ULL << 32), k_SPAD_REQUANT)
 
-// VPU (MxE4M3VpuGemminiRocketConfig): BF16 ops on scratchpad rows (1 row = 8 BF16, lane l = bytes 2l..2l+1).
+// LUT output: row m's 4-bit index into output codebook (act-out LUT) m >> G of the LUT format fp6 (1: FP6 class, 0: FP8
+// class) / alt (FP6: E2M3 else E3M2; FP8: E5M2 else E4M3-quad); packed 2 rows per byte as FP4. Codebooks loaded with
+// MX_LOAD_LUT sel 2 beforehand.
+#define gemmini_spad_requant_lut(dst, src, M, N, tiled, scale_dram, resident, fp6, alt, G) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, \
+    GEMMINI_SR_RS1(dst, src, tiled, scale_dram, resident), \
+    ((uint64_t)(M) & 0xFFFF) | (((uint64_t)(N) & 0xFFFF) << 16) | (1ULL << 33) | ((uint64_t)((fp6) ? 1 : 0) << 34) | \
+      ((uint64_t)((alt) ? 1 : 0) << 35) | (((uint64_t)(G) & 0x1F) << 36), k_SPAD_REQUANT)
+
+// VPU (MxE4M3VpuGemminiRocketConfig): BF16 ops on scratchpad rows (1 row = DIM/2 BF16, lane l = bytes 2l..2l+1).
 // Ops/ref: include/vpu_ref.h. Addresses are scratchpad row addresses (as mvin); rows = src1 rows processed;
 // rlen = rows per logical row (reductions write one row per rlen rows at dst + g; bcast reads src2 once per rlen
 // rows); imm = BF16 scalar (ADDS/MULS). src/dst may alias only exactly (in place). Ordered against other Gemmini
 // commands by the reservation station (4th queue, row-range dependencies); gemmini_fence() waits for it.
 #define gemmini_vpu(op, dst, src1, src2, rows, rlen, bcast, imm) \
   ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, \
-    ((uint64_t)(src1) & 0x3FFF) | (((uint64_t)(src2) & 0x3FFF) << 14) | (((uint64_t)(dst) & 0x3FFF) << 28) | \
-      (((uint64_t)(rows) & 0xFFFF) << 42), \
+    ((uint64_t)(src1) & GEMMINI_RA_MASK) | (((uint64_t)(src2) & GEMMINI_RA_MASK) << SPAD_ROW_ADDR_BITS) | \
+      (((uint64_t)(dst) & GEMMINI_RA_MASK) << (2 * SPAD_ROW_ADDR_BITS)) | (((uint64_t)(rows) & 0xFFFF) << (3 * SPAD_ROW_ADDR_BITS)), \
     ((uint64_t)(op) & 0xF) | ((uint64_t)((bcast) ? 1 : 0) << 4) | (((uint64_t)(rlen) & 0x3FF) << 5) | \
       (((uint64_t)(imm) & 0xFFFF) << 16), \
     k_VPU_EXEC)
@@ -520,6 +538,25 @@ static int ceil_divide_int(int a, int b){
     ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, (uint64_t)(A_sc_pitch), (uint64_t)(B_sc_pitch), k_LOOP_WS_CONFIG_SCALE_STRIDES) \
     gemmini_loop_ws(I, J, K, 0, 0, 0, A, B, NULL, C, A_stride, B_stride, 0, C_stride, \
                     false, false, false, false, ex_accumulate, NO_ACTIVATION, a_spad_id, b_spad_id, false) \
+  }
+
+// Scratchpad loop with loop-managed metadata: the loop loads its own A/B scale slices (A_sc/B_sc, row pitch in bytes per
+// E8M0 k-block) into the scale half of its slot and, when A_lut != 0, its act-in codebooks (one per 2^G rows of this
+// block; G = 1 under managed scales) into the LUT half of its slot. Lets software tile one LUT matmul into blocks.
+#define gemmini_loop_ws_spad_managed(I, J, K, A, B, C, A_sc, B_sc, A_sc_pitch, B_sc_pitch, A_lut, skips) \
+  { \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, (uint64_t)(A_sc), (uint64_t)(B_sc), k_LOOP_WS_CONFIG_SCALES) \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, (uint64_t)(A_sc_pitch), (uint64_t)(B_sc_pitch), k_LOOP_WS_CONFIG_SCALE_STRIDES) \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, (uint64_t)(A_lut), 0, k_LOOP_WS_CONFIG_LUTS) \
+    gemmini_loop_ws_spad(I, J, K, 0, 0, 0, A, B, 0, C, false, false, false, false, false, NO_ACTIVATION, 0, 0, false, skips) \
+  }
+
+// gemmini_loop_ws_mx plus loop-managed codebooks: the loop loads A_lut (act-in, rows >> G) and B_lut (weight, cols >> G)
+// codebooks into its slot's LUT halves (0 = not managed; e.g. act codebooks loaded flat once with MX_LOAD_LUT).
+#define gemmini_loop_ws_mx_lut(I, J, K, A, B, C, A_stride, B_stride, C_stride, A_sc, B_sc, A_sc_pitch, B_sc_pitch, A_lut, B_lut, ex_accumulate, a_spad_id, b_spad_id) \
+  { \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, (uint64_t)(A_lut), (uint64_t)(B_lut), k_LOOP_WS_CONFIG_LUTS) \
+    gemmini_loop_ws_mx(I, J, K, A, B, C, A_stride, B_stride, C_stride, A_sc, B_sc, A_sc_pitch, B_sc_pitch, ex_accumulate, a_spad_id, b_spad_id) \
   }
 
 #define gemmini_loop_ws_spad(I, J, K, pad_I, pad_J, pad_K, A, B, D, C, A_transpose, B_transpose, full_C, low_D, ex_accumulate, act, a_spad_id, b_spad_id, is_resadd, skips) \

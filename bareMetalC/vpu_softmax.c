@@ -16,11 +16,11 @@ int main() { printf("skipped: VPU config / Spike-only test\n"); return 0; }
 #define L 32
 #define RL (L / VPU_LANES)    // 4 scratchpad rows per logical row
 #define ROWS (M * RL)
-#define SP_S   0x0000   // bank 0
-#define SP_P   0x0400   // bank 0
-#define SP_MX  0x1000   // bank 1
-#define SP_X   0x2000   // bank 2
-#define SP_SUM 0x3000   // bank 3
+#define SP_S   0x0000              // bank 0 (BANK_ROWS units: DIM=16 is 0x0, 0x400, 0x1000, 0x2000, 0x3000)
+#define SP_P   (BANK_ROWS / 4)     // bank 0
+#define SP_MX  (1 * BANK_ROWS)     // bank 1
+#define SP_X   (2 * BANK_ROWS)     // bank 2
+#define SP_SUM (3 * BANK_ROWS)     // bank 3
 
 static uint16_t S[ROWS][VPU_LANES] __attribute__((aligned(64)));
 static uint16_t P_hw[ROWS][VPU_LANES] __attribute__((aligned(64)));

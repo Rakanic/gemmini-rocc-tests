@@ -17,6 +17,7 @@
 
 #include "include/gemmini_testutils.h"
 #include "include/matmul_fp6_128x128_chain.h"
+#include "include/mx_perf.h"
 
 #define TILE 16
 #define VALUES_PER_BYTE 2
@@ -118,6 +119,8 @@ int main() {
 
   gemmini_flush(0);
   fp6_config_ex();
+  mx_perf_t p1 = {0}, p2 = {0};
+  MX_PERF_MARK(p1.t0);
 
   // ================= MM1: C1 = requant(A1 @ B1), stored TILED =================
   gemmini_config_st(1 * sizeof(uint64_t));
@@ -151,11 +154,15 @@ int main() {
       gemmini_fence();
     }
 
+  mx_perf_ctr_start(&p1);   // before the mark: counter cmds stay out of the timed region
+  MX_PERF_MARK(p1.t_ld);
   gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
                        a_base, BANK_NUM * BANK_ROWS, 0, SPAD_DEST1,
                        false, false, false, false, false, NO_ACTIVATION, 0, 0, false,
                        CHAIN_FLAGS);
-  gemmini_fence();
+  MX_PERF_MARK(p1.t_ex);
+  mx_perf_ctr_stop(&p1);
+  p1.t_st = p1.t_ex;   // C1 stays resident: no mvout
 
   mvout_detile((uint8_t *) C1_hw, SPAD_DEST1, MATMUL_M / 2, MATMUL_N);
   int c1_err = check_nibbles("C1", (uint8_t *) C1_hw, (const uint8_t *) C1_out, MATMUL_M / 2, MATMUL_N);
@@ -173,6 +180,7 @@ int main() {
   // ================= MM2: C2 = requant(C1 @ B2), C1 read IN PLACE, LUT reused =================
   // MM2's activation-in LUT = MM1's OUTPUT LUT (C1_lut). Reuse c1_scales as A-scales ([M][GN]->[GK][M]).
 
+  MX_PERF_MARK(p2.t0);
   gemmini_config_st(1 * sizeof(uint64_t));
   MXQUANT_CFG((uint64_t)c2_scales, tiles_I, tiles_J, tiles_K, 0, 0, QUANT_LUT_UPDATE_GRANULARITY);
 
@@ -193,11 +201,15 @@ int main() {
       gemmini_fence();
     }
 
+  mx_perf_ctr_start(&p2);
+  MX_PERF_MARK(p2.t_ld);
   gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
                        SPAD_DEST1, BANK_NUM * BANK_ROWS, 0, SPAD_DEST2,
                        false, false, false, false, false, NO_ACTIVATION, 0, 0, false,
                        CHAIN_FLAGS);
-  gemmini_fence();
+  MX_PERF_MARK(p2.t_ex);
+  mx_perf_ctr_stop(&p2);
+  p2.t_st = p2.t_ex;
 
   mvout_detile((uint8_t *) C2_hw, SPAD_DEST2, MATMUL_M / 2, MATMUL_N);
   int c2_err = check_nibbles("C2", (uint8_t *) C2_hw, (const uint8_t *) C2_out, MATMUL_M / 2, MATMUL_N);
@@ -211,6 +223,13 @@ int main() {
         } }
   if (c2_err == 0 && c2_scale_err == 0) printf("MM2 chain OK (C2 codes+scales exact; C1 reused in place, LUT+scales reused).\n");
   else printf("MM2 chain FAILED: %d code, %d scale mismatches.\n", c2_err, c2_scale_err);
+
+  const uint64_t ideal = MX_PERF_IDEAL_QUAD(MATMUL_M, MATMUL_N, MATMUL_K, DIM);
+  mx_perf_report_ideal("fp6_e3m2_lut_chain_mm1", MATMUL_M, MATMUL_N, MATMUL_K, DIM, ideal, &p1);
+  mx_perf_report_ideal("fp6_e3m2_lut_chain_mm2", MATMUL_M, MATMUL_N, MATMUL_K, DIM, ideal, &p2);
+  { uint64_t ex = (p1.t_ex - p1.t_ld) + (p2.t_ex - p2.t_ld), tot = (p1.t_ex - p1.t0) + (p2.t_ex - p2.t0);
+    printf("PERF fp6_e3m2_lut_chain compute=%lu total=%lu ideal=%lu util=%lu%% (excl. C1 check)\n", (unsigned long)ex,
+           (unsigned long)tot, (unsigned long)(2 * ideal), (unsigned long)(ex ? 200 * ideal / ex : 0)); }
 
   int total = c1_err + c1_scale_err + c2_err + c2_scale_err;
   if (total == 0) printf("fp6 chain test PASSED (MM1 resident + reused as MM2 operand, LUT+scales reused).\n");

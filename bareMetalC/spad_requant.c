@@ -17,8 +17,8 @@ int main() { printf("skipped: SPAD_REQUANT config / Spike-only test\n"); return 
 #define N 64
 #define GN (N / 32)
 #define SP_SRC   0x0000   // bank 0: M*N/8 = 256 rows
-#define SP_FLAT  0x1000   // bank 1: M*N/16 = 128 rows
-#define SP_TILED 0x2000   // bank 2: (M/16)*(N/16)*16 = 128 rows
+#define SP_FLAT  (1 * BANK_ROWS)   // bank 1 (0x1000 at DIM16): M*N/16 = 128 rows
+#define SP_TILED (2 * BANK_ROWS)   // bank 2 (0x2000 at DIM16): (M/16)*(N/16)*16 = 128 rows
 
 static uint16_t X[M][N] __attribute__((aligned(64)));
 static uint8_t codes_hw[M * N] __attribute__((aligned(64)));
@@ -59,11 +59,11 @@ int main() {
   memset(scales_hw2, 0xa5, sizeof(scales_hw2));
 
   // ---- flat ----
-  for (int r = 0; r < M * N / 8; r += DIM) gemmini_extended_mvin((uint8_t *)X + r * DIM, SP_SRC + r, DIM, DIM);
+  for (int r = 0; r < M * N * 2 / DIM; r += DIM) gemmini_extended_mvin((uint8_t *)X + r * DIM, SP_SRC + r, DIM, DIM);
   uint64_t t0 = read_cycles();
   gemmini_spad_requant(SP_FLAT, SP_SRC, M, N, 0, (uint64_t)scales_hw, 0);
   memset(codes_hw, 0xa5, sizeof(codes_hw));
-  for (int r = 0; r < M * N / 16; r += DIM) gemmini_extended_mvout(codes_hw + r * DIM, SP_FLAT + r, DIM, DIM);
+  for (int r = 0; r < M * N / DIM; r += DIM) gemmini_extended_mvout(codes_hw + r * DIM, SP_FLAT + r, DIM, DIM);
   gemmini_fence();
   uint64_t t1 = read_cycles();
   int bad_flat = 0;
@@ -73,16 +73,16 @@ int main() {
         printf("  flat code[%d][%d]: hw %02x ref %02x\n", m, n, codes_hw[m * N + n], codes_ref[m][n]);
   int bad_sc = check_scales("flat", scales_hw);
 
-  // ---- operand-A tiled: tile (i, kt) row r at SP_TILED + (i*N/16 + kt)*16 + r ----
+  // ---- operand-A tiled: tile (i, kt) row r at SP_TILED + (i*N/DIM + kt)*DIM + r ----
   gemmini_spad_requant(SP_TILED, SP_SRC, M, N, 1, (uint64_t)scales_hw2, 0);
   memset(codes_hw, 0xa5, sizeof(codes_hw));
-  for (int r = 0; r < M * N / 16; r += DIM) gemmini_extended_mvout(codes_hw + r * DIM, SP_TILED + r, DIM, DIM);
+  for (int r = 0; r < M * N / DIM; r += DIM) gemmini_extended_mvout(codes_hw + r * DIM, SP_TILED + r, DIM, DIM);
   gemmini_fence();
   int bad_tiled = 0;
   for (int m = 0; m < M; m++)
     for (int n = 0; n < N; n++) {
-      int row = ((m / 16) * (N / 16) + n / 16) * 16 + m % 16;
-      uint8_t got = codes_hw[row * DIM + n % 16];
+      int row = ((m / DIM) * (N / DIM) + n / DIM) * DIM + m % DIM;
+      uint8_t got = codes_hw[row * DIM + n % DIM];
       if (got != codes_ref[m][n] && bad_tiled++ < 4)
         printf("  tiled code[%d][%d]: hw %02x ref %02x\n", m, n, got, codes_ref[m][n]);
     }
