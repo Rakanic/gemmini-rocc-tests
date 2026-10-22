@@ -324,7 +324,7 @@ int main() {
   uint8_t *sf_bytes = (uint8_t *) scale_factors;
   for (int i = 0; i < MATMUL_M; i++) {
     for (int b = 0; b < MATMUL_GN; b++) {
-      uint8_t got = sf_bytes[i * MATMUL_GN + b];
+      uint8_t got = sf_bytes[b * MATMUL_M + i];
       uint8_t exp = C_scales_row[b][i];
       if (got != exp) {
         scale_errors++;

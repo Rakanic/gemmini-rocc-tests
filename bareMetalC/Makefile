@@ -173,6 +173,8 @@ mx_tests = \
 	matmul_tiled_fp6_e2m3_lut_64x64_requant_dim8 \
 	matmul_tiled_fp6_e3m2_lut_64x64_requant_dim8 \
 	matmul_tiled_fp4_64x64_requant_dim8 \
+	matmul_tiled_fp4_64x64_requant_dim4 \
+	matmul_tiled_fp6_e3m2_lut_64x64_requant_dim4 \
 	matmul_tiled_asym_e4m3_e5m2_64x64_dim8 \
 	matmul_tiled_asym_fp4_fp6_64x64_dim8 \
 	matmul_tiled_asym_fp6_fp4_64x64_dim8 \

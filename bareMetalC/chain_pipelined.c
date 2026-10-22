@@ -60,7 +60,7 @@ static int compare_scales(const uint8_t *hw, const uint8_t golden[M][MATMUL_GN],
     for (int b = 0; b < MATMUL_GN; b++) {
       int ref = golden[m][b];
       if (ref <= 104 || ref + shift > 254) { (*skipped)++; continue; }   // clamped scales do not move
-      bad += hw[m * MATMUL_GN + b] != ref + shift;
+      bad += hw[b * MATMUL_M + m] != ref + shift;
     }
   return bad;
 }

@@ -195,7 +195,7 @@ int main() {
   uint8_t *sf = (uint8_t *) c1_scales;
   for (int i = 0; i < MATMUL_M; i++)
     for (int b = 0; b < MATMUL_GN; b++) {
-      uint8_t got = sf[i * MATMUL_GN + b], exp = C1_scales_out[i][b];
+      uint8_t got = sf[b * MATMUL_M + i], exp = C1_scales_out[i][b];
       if (got != exp) {
         scale_errors++;
         if (scale_errors <= 64) printf("C1_scale[%d][%d], Got: %x, Exp: %x\n", i, b, got, exp);
@@ -235,7 +235,8 @@ int main() {
     }
 
   gemmini_config_st(1 * sizeof(uint16_t));
-  MXQUANT_CFG((uint64_t)c2_scales, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  // C1's resident scales landed in the act-window half MM1 did not read (half 1): MM2 reads that half
+  MXQUANT_CFG((uint64_t)c2_scales, tiles_I, tiles_J, tiles_K, 1, 0, 1);
 
   // Operand A = C1 resident at SPAD_DEST1 (skip A mvin via 0x38); output C2 tiled at SPAD_DEST2.
   gemmini_loop_ws_spad(
@@ -277,7 +278,7 @@ int main() {
   uint8_t *sf2 = (uint8_t *) c2_scales;
   for (int i = 0; i < MATMUL_M; i++)
     for (int b = 0; b < MATMUL_GN; b++) {
-      uint8_t got = sf2[i * MATMUL_GN + b], exp = C2_scales_out[i][b];
+      uint8_t got = sf2[b * MATMUL_M + i], exp = C2_scales_out[i][b];
       if (got != exp) {
         c2_scale_errors++;
         if (c2_scale_errors <= 64) printf("C2_scale[%d][%d], Got: %x, Exp: %x\n", i, b, got, exp);

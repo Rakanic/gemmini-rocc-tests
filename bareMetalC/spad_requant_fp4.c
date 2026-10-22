@@ -51,8 +51,8 @@ static int check_scales(const char *name, const uint8_t *hw) {
   int bad = 0;
   for (int m = 0; m < M; m++)
     for (int b = 0; b < GN; b++)
-      if (hw[m * GN + b] != scales_ref[m][b] && bad++ < 4)
-        printf("  %s scale[%d][%d]: hw %02x ref %02x\n", name, m, b, hw[m * GN + b], scales_ref[m][b]);
+      if (hw[b * M + m] != scales_ref[m][b] && bad++ < 4)
+        printf("  %s scale[%d][%d]: hw %02x ref %02x\n", name, m, b, hw[b * M + m], scales_ref[m][b]);
   return bad;
 }
 

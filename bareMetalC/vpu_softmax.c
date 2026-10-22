@@ -30,10 +30,10 @@ static uint32_t lcg = 777;
 static uint32_t rnd(void) { lcg = lcg * 1103515245u + 12345u; return lcg >> 8; }
 
 static void mvin_rows(const void *src, uint32_t sp, int rows) {
-  for (int r = 0; r < rows; r += DIM) gemmini_extended_mvin((const uint8_t *)src + r * DIM, sp + r, DIM, DIM);
+  for (int r = 0; r < rows; r += DIM) gemmini_extended_mvin((const uint8_t *)src + r * DIM * sizeof(elem_t), sp + r, DIM, DIM);
 }
 static void mvout_rows(void *dst, uint32_t sp, int rows) {
-  for (int r = 0; r < rows; r += DIM) gemmini_extended_mvout((uint8_t *)dst + r * DIM, sp + r, DIM, DIM);
+  for (int r = 0; r < rows; r += DIM) gemmini_extended_mvout((uint8_t *)dst + r * DIM * sizeof(elem_t), sp + r, DIM, DIM);
 }
 
 int main() {
@@ -42,8 +42,8 @@ int main() {
       S[r][l] = vpu_f_to_bf16(((float)(int)(rnd() % 2001) - 1000.0f) / 125.0f);   // [-8, 8]
 
   gemmini_flush(0);
-  gemmini_config_ld(DIM);
-  gemmini_config_st(DIM);
+  gemmini_config_ld(DIM * sizeof(elem_t));
+  gemmini_config_st(DIM * sizeof(elem_t));
   uint64_t t0 = read_cycles();
   mvin_rows(S, SP_S, ROWS);
   uint64_t t1 = read_cycles();

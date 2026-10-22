@@ -154,9 +154,9 @@ int main() {
   { uint8_t *sf = (uint8_t *) c1_scales;
     for (int i = 0; i < MATMUL_M; i++)
       for (int b = 0; b < MATMUL_GN; b++)
-        if (sf[i * MATMUL_GN + b] != C1_scales_out[i][b]) {
+        if (sf[b * MATMUL_M + i] != C1_scales_out[i][b]) {
           c1_scale_err++;
-          if (c1_scale_err <= 40) printf("C1_scale[%d][%d] got %x exp %x\n", i, b, sf[i * MATMUL_GN + b], C1_scales_out[i][b]);
+          if (c1_scale_err <= 40) printf("C1_scale[%d][%d] got %x exp %x\n", i, b, sf[b * MATMUL_M + i], C1_scales_out[i][b]);
         } }
   if (c1_err == 0 && c1_scale_err == 0) printf("MM1 residency OK (C1 codes+scales exact).\n");
   else printf("MM1 residency FAILED: %d code, %d scale mismatches.\n", c1_err, c1_scale_err);
@@ -178,7 +178,8 @@ int main() {
                             b_base + (k * tiles_J + j) * DIM, DIM, DIM);
 
   gemmini_config_st(1 * sizeof(uint16_t));
-  MXQUANT_CFG((uint64_t)c2_scales, tiles_I, tiles_J, tiles_K, 0, 0, 1);
+  // C1's resident scales landed in the act-window half MM1 did not read (half 1): MM2 reads that half
+  MXQUANT_CFG((uint64_t)c2_scales, tiles_I, tiles_J, tiles_K, 1, 0, 1);
 
   gemmini_loop_ws_spad(tiles_I, tiles_J, tiles_K, 0, 0, 0,
                        SPAD_DEST1, BANK_NUM * BANK_ROWS, 0, SPAD_DEST2,
@@ -192,9 +193,9 @@ int main() {
   { uint8_t *sf = (uint8_t *) c2_scales;
     for (int i = 0; i < MATMUL_M; i++)
       for (int b = 0; b < MATMUL_GN; b++)
-        if (sf[i * MATMUL_GN + b] != C2_scales_out[i][b]) {
+        if (sf[b * MATMUL_M + i] != C2_scales_out[i][b]) {
           c2_scale_err++;
-          if (c2_scale_err <= 40) printf("C2_scale[%d][%d] got %x exp %x\n", i, b, sf[i * MATMUL_GN + b], C2_scales_out[i][b]);
+          if (c2_scale_err <= 40) printf("C2_scale[%d][%d] got %x exp %x\n", i, b, sf[b * MATMUL_M + i], C2_scales_out[i][b]);
         } }
   if (c2_err == 0 && c2_scale_err == 0) printf("MM2 chain OK (C2 codes+scales exact; C1 reused in place, scales reused).\n");
   else printf("MM2 chain FAILED: %d code, %d scale mismatches.\n", c2_err, c2_scale_err);

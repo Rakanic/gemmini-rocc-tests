@@ -32,8 +32,8 @@ static int check_scales(const char *name, const uint8_t *hw) {
   int bad = 0;
   for (int m = 0; m < M; m++)
     for (int b = 0; b < GN; b++)
-      if (hw[m * GN + b] != C_scales_row[b][m] && bad++ < 4)
-        printf("  %s scale[%d][%d]: hw %02x ref %02x\n", name, m, b, hw[m * GN + b], C_scales_row[b][m]);
+      if (hw[b * M + m] != C_scales_row[b][m] && bad++ < 4)
+        printf("  %s scale[%d][%d]: hw %02x ref %02x\n", name, m, b, hw[b * M + m], C_scales_row[b][m]);
   return bad;
 }
 

@@ -49,11 +49,11 @@ static uint16_t rand_bf16(int elo, int ehi, int sign) {
 
 static void mvin_rows(const void *src, uint32_t sp, int rows) {
   for (int r = 0; r < rows; r += DIM)
-    gemmini_extended_mvin((const uint8_t *)src + r * DIM, sp + r, DIM, rows - r < DIM ? rows - r : DIM);
+    gemmini_extended_mvin((const uint8_t *)src + r * DIM * sizeof(elem_t), sp + r, DIM, rows - r < DIM ? rows - r : DIM);
 }
 static void mvout_rows(void *dst, uint32_t sp, int rows) {
   for (int r = 0; r < rows; r += DIM)
-    gemmini_extended_mvout((uint8_t *)dst + r * DIM, sp + r, DIM, rows - r < DIM ? rows - r : DIM);
+    gemmini_extended_mvout((uint8_t *)dst + r * DIM * sizeof(elem_t), sp + r, DIM, rows - r < DIM ? rows - r : DIM);
 }
 
 static int check(const char *name, int rows) {
@@ -95,8 +95,8 @@ int main() {
   P[0][0] = 0x0000; P[0][1] = 0x7f80; P[0][2] = 0x0001;
 
   gemmini_flush(0);
-  gemmini_config_ld(DIM);
-  gemmini_config_st(DIM);
+  gemmini_config_ld(DIM * sizeof(elem_t));
+  gemmini_config_st(DIM * sizeof(elem_t));
 
   mvin_rows(A, SP_A, N);
   mvin_rows(A2, SP_A2, N);

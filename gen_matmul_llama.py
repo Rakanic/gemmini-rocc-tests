@@ -77,6 +77,8 @@ def precision_for_dim(dim: int):
     (Python frac = Scala sigWidth - 1): prod = MxFloat(4,4,4) uniform -> (4,3); acc = the DIM=16 ramp
     for rows 0-15, extra rows (DIM>16) bf16 MxFloat(8,8,4) -> (8,7). dim=16 reproduces the originals."""
     prod = [(4, 3)] * dim
+    if dim < 8:
+        return prod, [(8, 7)] * dim   # DIM=4: all acc rows bf16 (dim4MxFPConfig)
     acc = ACC_PRECISION[:dim] if dim <= 16 else ACC_PRECISION + [(8, 7)] * (dim - 16)
     return prod, acc
 
@@ -188,6 +190,10 @@ SHAPES = [
     Shape("matmul_fp4_64x64_dim8.h", 64, 64, 64, "fp4", dim=8, layer="layer2",
           guard="INCLUDE_MATMUL_FP4_64X64_DIM8_H",
           tests=("matmul_tiled_fp4_64x64_requant_dim8",)),
+    # FP4 on the 4x4 (DIM=4) mesh: W=4 acc widen (one acc row = 4 col-tiles = a 32-col block per output row).
+    Shape("matmul_fp4_64x64_dim4.h", 64, 64, 64, "fp4", dim=4, layer="layer2",
+          guard="INCLUDE_MATMUL_FP4_64X64_DIM4_H",
+          tests=("matmul_tiled_fp4_64x64_requant_dim4",)),
     # FP4 DIM=32, larger: 2 i-tiles x 2 j-tiles (GN=4, loop_bound_j=2), deeper K -- stresses multi-tile.
     Shape("matmul_fp4_128x128_dim32.h", 128, 128, 128, "fp4", dim=32, layer="layer2",
           guard="INCLUDE_MATMUL_FP4_128X128_DIM32_H",

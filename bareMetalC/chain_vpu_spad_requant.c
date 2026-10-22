@@ -91,8 +91,8 @@ static int check(const char *pass) {
     }
   for (int m = 0; m < M; m++)
     for (int b = 0; b < MATMUL_GN; b++)
-      if (c1_scales[m * MATMUL_GN + b] != c1_scales_ref[m][b] && bad1s++ < 4)
-        printf("  %s C1 scale[%d][%d]: hw %02x ref %02x\n", pass, m, b, c1_scales[m * MATMUL_GN + b], c1_scales_ref[m][b]);
+      if (c1_scales[b * MATMUL_M + m] != c1_scales_ref[m][b] && bad1s++ < 4)
+        printf("  %s C1 scale[%d][%d]: hw %02x ref %02x\n", pass, m, b, c1_scales[b * MATMUL_M + m], c1_scales_ref[m][b]);
   mvout_detile(got, SP_C2, M, N);
   for (int m = 0; m < M; m++)
     for (int n = 0; n < N; n++)
@@ -102,8 +102,8 @@ static int check(const char *pass) {
     for (int b = 0; b < MATMUL_GN; b++) {
       uint8_t ref = C2_scales_out[m][b];
       if (ref <= 104 || ref >= 254) { skipped++; continue; }   // clamped scales do not move with the x2
-      if (c2_scales[m * MATMUL_GN + b] != ref + 1 && bad2s++ < 4)
-        printf("  %s C2 scale[%d][%d]: hw %02x ref %02x\n", pass, m, b, c2_scales[m * MATMUL_GN + b], ref + 1);
+      if (c2_scales[b * MATMUL_M + m] != ref + 1 && bad2s++ < 4)
+        printf("  %s C2 scale[%d][%d]: hw %02x ref %02x\n", pass, m, b, c2_scales[b * MATMUL_M + m], ref + 1);
     }
   printf("%s: C1 codes %d, C1 scales %d, C2 codes %d, C2 scales %d mismatches (%d clamped C2 scales skipped; "
          "x2 C1 codes vs C1_out differ in %d)\n", pass, bad1, bad1s, bad2, bad2s, skipped, c1_vs_golden);
