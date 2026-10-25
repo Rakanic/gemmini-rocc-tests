@@ -1,6 +1,7 @@
 // See LICENSE for license details.
 
-// BF16 tiled matmul for the plain BF16 Gemmini (BF16Dim*BaselineConfig, gemmini_params_bf16_dim*_vpu.h):
+// BF16 tiled matmul for the plain BF16 Gemmini (BF16Dim*BaselineConfig, gemmini_params_bf16_dim*_vpu.h), two phases:
+// rounding (random BF16 data) and layout (multi-tile, padded, exact integer data; see L_DIM_*).
 // C = A * B + D with BF16 A, B, C and an FP32 bias D, checked bit-exactly against a CPU model of the hardware:
 //   - each mesh column sums one DIM-long K chunk through BF16 FMA PEs (hardfloat MulAddRecFN, one RNE rounding to BF16
 //     per PE, k ascending, starting from +0),
@@ -29,7 +30,7 @@
 #define MAT_DIM_K 128
 #define MAT_DIM_J 64
 #else
-#define MAT_DIM_I 8
+#define MAT_DIM_I 4
 #define MAT_DIM_K (2 * DIM)
 #define MAT_DIM_J DIM
 #endif
@@ -124,37 +125,28 @@ static uint16_t rand_bf16(void) {
   return (uint16_t)((sign << 15) | (exp << 7) | frac);
 }
 
-int main() {
-#ifndef BAREMETAL
-  if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
-    perror("mlockall failed");
-    exit(1);
-  }
-#endif
-  printf("BF16 tiled matmul, DIM %d: I %d, J %d, K %d\n", DIM, MAT_DIM_I, MAT_DIM_J, MAT_DIM_K);
-  gemmini_flush(0);
+// small integer as BF16 / FP32 (|v| <= 256 is exact in BF16)
+static uint16_t int_to_bf16(int v) { return f32_to_bf16((float)v); }
 
-  static elem_t A[MAT_DIM_I][MAT_DIM_K] row_align(1);
-  static elem_t B[MAT_DIM_K][MAT_DIM_J] row_align(1);
-  static elem_t C[MAT_DIM_I][MAT_DIM_J] row_align(1);
-  static acc_t D[MAT_DIM_I][MAT_DIM_J] row_align_acc(1);
-  static elem_t gold[MAT_DIM_I][MAT_DIM_J];
+static int check(const char *phase, int rows, int cols, const elem_t *C, const elem_t *gold) {
+  int errors = 0;
+  for (int i = 0; i < rows; i++)
+    for (int j = 0; j < cols; j++)
+      if (C[i * cols + j] != gold[i * cols + j]) {
+        if (errors < MAX_PRINTED_ERRORS)
+          printf("%s MISMATCH [%d][%d]: got 0x%04x, expected 0x%04x\n", phase, i, j, C[i * cols + j], gold[i * cols + j]);
+        errors++;
+      }
+  if (errors) printf("%s FAIL: %d of %d outputs differ\n", phase, errors, rows * cols);
+  else printf("%s PASS\n", phase);
+  return errors;
+}
 
-  for (size_t i = 0; i < MAT_DIM_I; i++)
-    for (size_t k = 0; k < MAT_DIM_K; k++)
-      A[i][k] = rand_bf16();
-  for (size_t k = 0; k < MAT_DIM_K; k++)
-    for (size_t j = 0; j < MAT_DIM_J; j++)
-      B[k][j] = rand_bf16();
-  for (size_t i = 0; i < MAT_DIM_I; i++)
-    for (size_t j = 0; j < MAT_DIM_J; j++)
-      D[i][j] = bf16_to_f32(rand_bf16());
-
-  printf("Starting gemmini matmul\n");
+static void run_matmul(int I, int J, int K, const elem_t *A, const elem_t *B, const acc_t *D, elem_t *C) {
   const unsigned long start = read_cycles();
-  tiled_matmul_auto(MAT_DIM_I, MAT_DIM_J, MAT_DIM_K,
-          (elem_t*)A, (elem_t*)B, &D[0][0], (elem_t*)C,
-          MAT_DIM_K, MAT_DIM_J, MAT_DIM_J, MAT_DIM_J,
+  tiled_matmul_auto(I, J, K,
+          (elem_t*)A, (elem_t*)B, (acc_t*)D, C,
+          K, J, J, J,
           MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY,
           NO_ACTIVATION, ACC_SCALE_IDENTITY, 0, false,
           false, false,
@@ -162,35 +154,90 @@ int main() {
           0,
           WS);
   gemmini_fence();
-  const unsigned long end = read_cycles();
-  printf("Cycles taken: %lu\n", end - start);
+  printf("Cycles taken: %lu\n", read_cycles() - start);
+}
 
-  printf("Starting CPU reference\n");
-  for (size_t i = 0; i < MAT_DIM_I; i++)
-    for (size_t j = 0; j < MAT_DIM_J; j++) {
-      float acc = D[i][j];
-      for (size_t k0 = 0; k0 < MAT_DIM_K; k0 += DIM) {
-        uint16_t s = 0;
-        for (size_t k = k0; k < k0 + DIM && k < MAT_DIM_K; k++)
-          s = bf16_fma(A[i][k], B[k][j], s);
-        acc = acc + bf16_to_f32(s);
-      }
-      gold[i][j] = f32_to_bf16(acc);
-    }
+// Phase 2 (layout): 2 tiles in I and J, 3 in K, none a multiple of DIM, so the loop's tile addressing, padding and
+// K accumulation are all exercised. Values in {-1, 0, 1} (bias -4..4) keep every BF16 FMA and FP32 add exact, so the
+// reference is a plain integer matmul and stays cheap in RTL simulation.
+#define L_DIM_I (DIM + 3)
+#define L_DIM_J (DIM + 5)
+#define L_DIM_K (2 * DIM + 7)
 
-  int errors = 0;
-  for (size_t i = 0; i < MAT_DIM_I; i++)
-    for (size_t j = 0; j < MAT_DIM_J; j++)
-      if (C[i][j] != gold[i][j]) {
-        if (errors < MAX_PRINTED_ERRORS)
-          printf("MISMATCH [%d][%d]: got 0x%04x, expected 0x%04x\n", (int)i, (int)j, C[i][j], gold[i][j]);
-        errors++;
-      }
-  if (errors) {
-    printf("FAIL: %d of %d outputs differ\n", errors, MAT_DIM_I * MAT_DIM_J);
+int main() {
+#ifndef BAREMETAL
+  if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+    perror("mlockall failed");
     exit(1);
   }
+#endif
+  gemmini_flush(0);
+  int errors = 0;
 
+  // Phase 1 (rounding): random BF16 data, bit-exact against the BF16 FMA / FP32 accumulator model
+  {
+    printf("BF16 rounding: DIM %d, I %d, J %d, K %d\n", DIM, MAT_DIM_I, MAT_DIM_J, MAT_DIM_K);
+    static elem_t A[MAT_DIM_I][MAT_DIM_K] row_align(1);
+    static elem_t B[MAT_DIM_K][MAT_DIM_J] row_align(1);
+    static elem_t C[MAT_DIM_I][MAT_DIM_J] row_align(1);
+    static acc_t D[MAT_DIM_I][MAT_DIM_J] row_align_acc(1);
+    static elem_t gold[MAT_DIM_I][MAT_DIM_J];
+
+    for (size_t i = 0; i < MAT_DIM_I; i++)
+      for (size_t k = 0; k < MAT_DIM_K; k++)
+        A[i][k] = rand_bf16();
+    for (size_t k = 0; k < MAT_DIM_K; k++)
+      for (size_t j = 0; j < MAT_DIM_J; j++)
+        B[k][j] = rand_bf16();
+    for (size_t i = 0; i < MAT_DIM_I; i++)
+      for (size_t j = 0; j < MAT_DIM_J; j++)
+        D[i][j] = bf16_to_f32(rand_bf16());
+
+    run_matmul(MAT_DIM_I, MAT_DIM_J, MAT_DIM_K, &A[0][0], &B[0][0], &D[0][0], &C[0][0]);
+
+    for (size_t i = 0; i < MAT_DIM_I; i++)
+      for (size_t j = 0; j < MAT_DIM_J; j++) {
+        float acc = D[i][j];
+        for (size_t k0 = 0; k0 < MAT_DIM_K; k0 += DIM) {
+          uint16_t s = 0;
+          for (size_t k = k0; k < k0 + DIM && k < MAT_DIM_K; k++)
+            s = bf16_fma(A[i][k], B[k][j], s);
+          acc = acc + bf16_to_f32(s);
+        }
+        gold[i][j] = f32_to_bf16(acc);
+      }
+    errors += check("rounding", MAT_DIM_I, MAT_DIM_J, &C[0][0], &gold[0][0]);
+  }
+
+  // Phase 2 (layout)
+  {
+    printf("BF16 layout: DIM %d, I %d, J %d, K %d\n", DIM, L_DIM_I, L_DIM_J, L_DIM_K);
+    static int8_t Ai[L_DIM_I][L_DIM_K], Bi[L_DIM_K][L_DIM_J];
+    static elem_t A[L_DIM_I][L_DIM_K] row_align(1);
+    static elem_t B[L_DIM_K][L_DIM_J] row_align(1);
+    static elem_t C[L_DIM_I][L_DIM_J] row_align(1);
+    static acc_t D[L_DIM_I][L_DIM_J] row_align_acc(1);
+    static elem_t gold[L_DIM_I][L_DIM_J];
+
+    for (int i = 0; i < L_DIM_I; i++)
+      for (int k = 0; k < L_DIM_K; k++) { Ai[i][k] = (int8_t)(lcg() % 3) - 1; A[i][k] = int_to_bf16(Ai[i][k]); }
+    for (int k = 0; k < L_DIM_K; k++)
+      for (int j = 0; j < L_DIM_J; j++) { Bi[k][j] = (int8_t)(lcg() % 3) - 1; B[k][j] = int_to_bf16(Bi[k][j]); }
+    for (int i = 0; i < L_DIM_I; i++)
+      for (int j = 0; j < L_DIM_J; j++) D[i][j] = (float)((int)(lcg() % 9) - 4);
+
+    run_matmul(L_DIM_I, L_DIM_J, L_DIM_K, &A[0][0], &B[0][0], &D[0][0], &C[0][0]);
+
+    for (int i = 0; i < L_DIM_I; i++)
+      for (int j = 0; j < L_DIM_J; j++) {
+        int acc = (int)D[i][j];
+        for (int k = 0; k < L_DIM_K; k++) acc += Ai[i][k] * Bi[k][j];
+        gold[i][j] = int_to_bf16(acc);
+      }
+    errors += check("layout", L_DIM_I, L_DIM_J, &C[0][0], &gold[0][0]);
+  }
+
+  if (errors) exit(1);
   printf("PASS\n");
   exit(0);
 }
