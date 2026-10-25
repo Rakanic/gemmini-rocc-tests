@@ -248,6 +248,12 @@ ifeq ($(HAS_MX_SCALING),yes)
 tests += $(mx_tests)
 endif
 
+# Plain BF16 Gemmini (gemmini_params_bf16_dim*_vpu.h): BF16 elements, no MX scaling
+HAS_BF16_ELEM := $(shell grep -q 'define ELEM_T_EXP_BITS 8' $(abs_top_srcdir)/include/gemmini_params.h 2>/dev/null && grep -q 'define ELEM_T_SIG_BITS 8' $(abs_top_srcdir)/include/gemmini_params.h && echo yes)
+ifeq ($(HAS_BF16_ELEM),yes)
+tests += tiled_matmul_bf16
+endif
+
 tests_baremetal = $(tests:=-baremetal)
 
 ifeq ($(findstring spike,$(RUNNER)),spike)
