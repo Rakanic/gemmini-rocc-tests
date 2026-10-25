@@ -9,6 +9,7 @@
 #define ADDR_LEN 32
 #define BANK_NUM 4
 #define BANK_ROWS 4096
+#define SPAD_ROW_ADDR_BITS 14
 #define ACC_ROWS 512
 #define MAX_BYTES 64
 #define MAX_BLOCK_LEN (MAX_BYTES/(DIM*1))
